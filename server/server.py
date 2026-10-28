@@ -451,26 +451,27 @@ def download_feishu_resource(message_id: str, file_key: str, dest_path: Path):
         return False
 
 def convert_to_wav(src_path: Path, dst_wav_path: Path):
-    # 使用 loudnorm 广播级响度均衡化 (EBU R128 标准)
-    # 无论是微弱的微信/飞书手机语音，还是不同距离的录音，自动将目标响度标准化至 -14 LUFS，
-    # 消除真实人声录音与高动态 TTS 合成语音之间的音量落差，确保孩子在墨水屏设备端听得清脆饱满！
+    # 智能裁剪首尾静音 + loudnorm 广播级响度均衡化 (EBU R128 标准)
+    # 1. silenceremove: 毫秒级直接切除父母录音前后的发呆/未开口空白，不仅不增加耗时，而且让播放时开口即出声！
+    # 2. loudnorm: 将目标响度标准化至 -14 LUFS，确保孩子在墨水屏设备端听得清脆饱满！
     cmd = [
         "ffmpeg", "-y", "-i", str(src_path),
-        "-af", "loudnorm=I=-14:TP=-1.0:LRA=11",
+        "-af", "silenceremove=start_periods=1:start_duration=0.08:start_threshold=-40dB:stop_periods=1:stop_duration=0.15:stop_threshold=-40dB,loudnorm=I=-14:TP=-1.0:LRA=11",
         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
         str(dst_wav_path)
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 def convert_to_opus(src_wav: Path, dst_opus: Path):
-    # 设备端录音降噪与人声增强处理：
-    # 1. highpass=f=100: 滤除 100Hz 以下由于电路供电、手持摩擦引起的机械低频嗡嗡声
-    # 2. lowpass=f=4000: 滤除 4kHz 以上高频白噪声和底噪沙沙声
-    # 3. afftdn: FFT 频域动态频谱降噪，去除稳定的背景环境底噪
-    # 4. loudnorm: 确保孩子轻声说话时在飞书里依然清晰可闻
+    # 设备端录音静音裁剪 + 降噪与人声增强处理：
+    # 1. silenceremove: 切除孩子录音按下与开口前、说完松手前的多余空白，音频更短更精炼，上传飞书速度反而更快！
+    # 2. highpass=f=100: 滤除 100Hz 以下由于电路供电、手持摩擦引起的机械低频嗡嗡声
+    # 3. lowpass=f=4000: 滤除 4kHz 以上高频白噪声和底噪沙沙声
+    # 4. afftdn: FFT 频域动态频谱降噪，去除稳定的背景环境底噪
+    # 5. loudnorm: 确保孩子轻声说话时在飞书里依然清晰可闻
     cmd = [
         "ffmpeg", "-y", "-i", str(src_wav),
-        "-af", "highpass=f=100,lowpass=f=4000,afftdn=nf=-45:nr=18,loudnorm=I=-14:TP=-1.0:LRA=11",
+        "-af", "silenceremove=start_periods=1:start_duration=0.08:start_threshold=-38dB:stop_periods=1:stop_duration=0.15:stop_threshold=-38dB,highpass=f=100,lowpass=f=4000,afftdn=nf=-45:nr=18,loudnorm=I=-14:TP=-1.0:LRA=11",
         "-c:a", "libopus", "-b:a", "16k", "-ar", "16000", "-ac", "1",
         str(dst_opus)
     ]

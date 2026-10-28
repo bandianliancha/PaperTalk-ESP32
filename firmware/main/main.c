@@ -587,7 +587,7 @@ static void play_latest_audio(void) {
     }
 
     // 预热防 Pop 破音：先给 I2S 喂一小段静音帧使 DAC 稳压，再开启功放
-    uint8_t zero_lead[512] = {0};
+    uint8_t zero_lead[128] = {0};
     esp_codec_dev_write(play_dev, zero_lead, sizeof(zero_lead));
 
     gpio_hold_dis(PA_CTRL_PIN);
