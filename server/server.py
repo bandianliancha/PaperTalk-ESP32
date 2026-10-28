@@ -451,27 +451,23 @@ def download_feishu_resource(message_id: str, file_key: str, dest_path: Path):
         return False
 
 def convert_to_wav(src_path: Path, dst_wav_path: Path):
-    # 智能裁剪首尾静音 + loudnorm 广播级响度均衡化 (EBU R128 标准)
-    # 1. silenceremove: 毫秒级直接切除父母录音前后的发呆/未开口空白，不仅不增加耗时，而且让播放时开口即出声！
-    # 2. loudnorm: 将目标响度标准化至 -14 LUFS，确保孩子在墨水屏设备端听得清脆饱满！
+    # 彻底移除 silenceremove 激进切除逻辑，避免吞字切字！
+    # 采用高保真直转，配合 loudnorm 响度均衡化 (EBU R128 标准)，
+    # 完整保留语音开头和结尾的每一个字与呼吸细节，音质 100% 完整！
     cmd = [
         "ffmpeg", "-y", "-i", str(src_path),
-        "-af", "silenceremove=start_periods=1:start_duration=0.08:start_threshold=-40dB:stop_periods=1:stop_duration=0.15:stop_threshold=-40dB,loudnorm=I=-14:TP=-1.0:LRA=11",
+        "-af", "loudnorm=I=-14:TP=-1.0:LRA=11",
         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
         str(dst_wav_path)
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 def convert_to_opus(src_wav: Path, dst_opus: Path):
-    # 设备端录音静音裁剪 + 降噪与人声增强处理：
-    # 1. silenceremove: 切除孩子录音按下与开口前、说完松手前的多余空白，音频更短更精炼，上传飞书速度反而更快！
-    # 2. highpass=f=100: 滤除 100Hz 以下由于电路供电、手持摩擦引起的机械低频嗡嗡声
-    # 3. lowpass=f=4000: 滤除 4kHz 以上高频白噪声和底噪沙沙声
-    # 4. afftdn: FFT 频域动态频谱降噪，去除稳定的背景环境底噪
-    # 5. loudnorm: 确保孩子轻声说话时在飞书里依然清晰可闻
+    # 彻底移除 silenceremove，绝不误切孩子的开头第一个字！
+    # 仅保留纯净人声滤波与环境降噪，完整保留每一个字：
     cmd = [
         "ffmpeg", "-y", "-i", str(src_wav),
-        "-af", "silenceremove=start_periods=1:start_duration=0.08:start_threshold=-38dB:stop_periods=1:stop_duration=0.15:stop_threshold=-38dB,highpass=f=100,lowpass=f=4000,afftdn=nf=-45:nr=18,loudnorm=I=-14:TP=-1.0:LRA=11",
+        "-af", "highpass=f=100,lowpass=f=4000,afftdn=nf=-45:nr=18,loudnorm=I=-14:TP=-1.0:LRA=11",
         "-c:a", "libopus", "-b:a", "16k", "-ar", "16000", "-ac", "1",
         str(dst_opus)
     ]
@@ -662,9 +658,16 @@ async def ws_handler(request):
     try:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
-                logger.info(f"Device says: {msg.data.strip()}")
+                raw_text = msg.data.strip()
+                logger.info(f"Device says: {raw_text}")
                 try:
-                    payload = json.loads(msg.data.strip())
+                    # 容错解析：如果 ESP32 发来的文本存在粘包或尾随字符，提取第一段完整 JSON
+                    try:
+                        payload = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        decoder = json.JSONDecoder()
+                        payload, _ = decoder.raw_decode(raw_text)
+
                     action = payload.get("action")
                     if "battery" in payload:
                         device_state["battery_pct"] = payload["battery"]
@@ -694,11 +697,7 @@ async def ws_handler(request):
                         })
 
                     elif action == "recording_start":
-                        render_child_screen("recording")
-                        await notify_device({
-                            "type": "refresh_screen",
-                            "screen_url": "/api/screen/latest.bin"
-                        })
+                        pass # 录音过程屏幕保持现状，不触发墨水屏刷新
                     elif action == "status_report":
                         batt = payload.get("battery", 100)
                         chg = payload.get("charging", False)

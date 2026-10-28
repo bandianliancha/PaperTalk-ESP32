@@ -647,7 +647,7 @@ static void play_latest_audio(void) {
         g_unread_count--;
         trigger_screen_refresh();
         if (ws_client && esp_websocket_client_is_connected(ws_client)) {
-            esp_websocket_client_send_text(ws_client, "{\"action\":\"played\"}", 19, portMAX_DELAY);
+            esp_websocket_client_send_text(ws_client, "{\"action\":\"played\"}", -1, portMAX_DELAY);
         }
     }
     ESP_LOGI(TAG, "Playback completed! Remaining unread locally: %d", g_unread_count);
@@ -664,7 +664,7 @@ static void record_and_upload(void) {
     play_beep_tone(1000, 40);
 
     if (ws_client && esp_websocket_client_is_connected(ws_client)) {
-        esp_websocket_client_send_text(ws_client, "{\"action\":\"recording_start\"}", 29, portMAX_DELAY);
+        esp_websocket_client_send_text(ws_client, "{\"action\":\"recording_start\"}", -1, portMAX_DELAY);
     }
 
     size_t max_bytes = 16000 * 2 * 15; // 最多录制 15 秒语音 (原10秒扩展，满足完整表达)
