@@ -493,63 +493,157 @@ static void bsp_audio_init(void) {
     ESP_LOGI(TAG, "Audio ES8311 initialized successfully!");
 }
 
-// ── 播放留言 ───────────────────────────────────────────────────
-static void play_latest_audio(void) {
-    ESP_LOGI(TAG, "Starting audio playback from server...");
+// ── 本地音频预缓存体系 (PSRAM 预下载 + 重复播放支持) ─────────────
+#define AUDIO_PRELOAD_MAX_BYTES (16000 * 2 * 60) // 最多支持 60 秒音频 (约 1.9MB)，Note4 具备 8MB PSRAM 绰绰有余
+static uint8_t *g_preload_audio_buf = NULL;
+static size_t g_preload_audio_len = 0;
+static bool g_preload_is_ready = false;
+static bool g_preload_in_progress = false;
+static int g_current_audio_id = 0;
+static TaskHandle_t g_preload_task_handle = NULL;
+
+static void preload_audio_task(void *pvParameters) {
+    g_preload_in_progress = true;
+    ESP_LOGI(TAG, "Background preloading latest audio from server...");
+
     char url[128];
     snprintf(url, sizeof(url), "http://%s:%d/api/audio/latest.wav", g_server_host, g_server_port);
 
     esp_http_client_config_t config = {
         .url = url,
-        .timeout_ms = 5000,
+        .timeout_ms = 8000,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Preload failed to open HTTP: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
+        g_preload_in_progress = false;
+        vTaskDelete(NULL);
         return;
     }
 
     esp_http_client_fetch_headers(client);
 
-    vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_hold_dis(PA_CTRL_PIN);
-    gpio_set_level(PA_CTRL_PIN, 1);
-    gpio_hold_en(PA_CTRL_PIN);
+    if (!g_preload_audio_buf) {
+        g_preload_audio_buf = heap_caps_malloc(AUDIO_PRELOAD_MAX_BYTES, MALLOC_CAP_SPIRAM);
+    }
 
-    char *buf = malloc(1024);
-    int read_bytes = 0;
+    if (!g_preload_audio_buf) {
+        ESP_LOGE(TAG, "Failed to allocate PSRAM for audio preload!");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        g_preload_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // 过滤掉 44 字节 WAV 头，直接在 PSRAM 里存纯 PCM 数据，播放时零耗时解头
     int header_skip = 44;
+    char skip_buf[64];
     while (header_skip > 0) {
-        int r = esp_http_client_read(client, buf, header_skip > 1024 ? 1024 : header_skip);
+        int r = esp_http_client_read(client, skip_buf, header_skip > sizeof(skip_buf) ? sizeof(skip_buf) : header_skip);
         if (r <= 0) break;
         header_skip -= r;
     }
 
-    while ((read_bytes = esp_http_client_read(client, buf, 1024)) > 0) {
-        esp_codec_dev_write(play_dev, buf, read_bytes);
+    size_t total_read = 0;
+    int r = 0;
+    while (total_read < AUDIO_PRELOAD_MAX_BYTES &&
+           (r = esp_http_client_read(client, (char *)g_preload_audio_buf + total_read, 2048)) > 0) {
+        total_read += r;
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    g_preload_audio_len = total_read;
+    g_preload_is_ready = (total_read > 0);
+    g_preload_in_progress = false;
+    ESP_LOGI(TAG, "Audio preload finished! Size: %d bytes (ready=%d)", (int)total_read, g_preload_is_ready);
+
+    vTaskDelete(NULL);
+}
+
+static void start_preload_latest_audio(void) {
+    if (g_preload_in_progress) {
+        ESP_LOGW(TAG, "Audio preload already in progress, skipping...");
+        return;
+    }
+    g_preload_is_ready = false;
+    xTaskCreatePinnedToCore(preload_audio_task, "audio_preload", 4096, NULL, 5, &g_preload_task_handle, 1);
+}
+
+// ── 播放留言 (优先毫秒级直读本地 PSRAM 缓存，支持反复聆听) ──────
+static void play_latest_audio(void) {
+    ESP_LOGI(TAG, "Starting audio playback (preloaded=%d, len=%d)...", g_preload_is_ready, (int)g_preload_audio_len);
+
+    // 1. 如果后台预下载正好在进行中，稍等最多 500ms
+    int wait_cycles = 0;
+    while (g_preload_in_progress && wait_cycles < 25) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        wait_cycles++;
+    }
+
+    gpio_hold_dis(PA_CTRL_PIN);
+    gpio_set_level(PA_CTRL_PIN, 1); // 开启音频功放
+    gpio_hold_en(PA_CTRL_PIN);
+
+    // 2. 命中本地缓存：0 网络延迟极速播放！
+    if (g_preload_is_ready && g_preload_audio_buf && g_preload_audio_len > 0) {
+        ESP_LOGI(TAG, "Playing directly from local PSRAM buffer (Instant Start)!");
+        size_t offset = 0;
+        while (offset < g_preload_audio_len) {
+            size_t chunk = (g_preload_audio_len - offset > 2048) ? 2048 : (g_preload_audio_len - offset);
+            esp_codec_dev_write(play_dev, g_preload_audio_buf + offset, chunk);
+            offset += chunk;
+        }
+    } else {
+        // 3. Fallback 回退网络边下边播
+        ESP_LOGI(TAG, "Fallback to HTTP streaming playback...");
+        char url[128];
+        snprintf(url, sizeof(url), "http://%s:%d/api/audio/latest.wav", g_server_host, g_server_port);
+
+        esp_http_client_config_t config = {
+            .url = url,
+            .timeout_ms = 5000,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (esp_http_client_open(client, 0) == ESP_OK) {
+            esp_http_client_fetch_headers(client);
+            char *buf = malloc(1024);
+            int read_bytes = 0;
+            int header_skip = 44;
+            while (header_skip > 0) {
+                int r = esp_http_client_read(client, buf, header_skip > 1024 ? 1024 : header_skip);
+                if (r <= 0) break;
+                header_skip -= r;
+            }
+            while ((read_bytes = esp_http_client_read(client, buf, 1024)) > 0) {
+                esp_codec_dev_write(play_dev, buf, read_bytes);
+            }
+            free(buf);
+            esp_http_client_close(client);
+        }
+        esp_http_client_cleanup(client);
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
     gpio_hold_dis(PA_CTRL_PIN);
-    gpio_set_level(PA_CTRL_PIN, 0);
+    gpio_set_level(PA_CTRL_PIN, 0); // 关闭功放防底噪
     gpio_hold_en(PA_CTRL_PIN);
 
-    free(buf);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
     has_new_message = false;
-    gpio_set_level(LED_PIN, 1);
 
-    // 上报播放完毕
+    // 4. 反复听逻辑支持：
+    // 若当前仍有未读信封，则听完后消减一封，并向服务端上报已读；
+    // 缓存 g_preload_audio_buf 并不清空，支持孩子在读完后反复按键重听！
     if (g_unread_count > 0) {
         g_unread_count--;
-    }
-    trigger_screen_refresh();
-
-    if (ws_client && esp_websocket_client_is_connected(ws_client)) {
-        esp_websocket_client_send_text(ws_client, "{\"action\":\"played\"}", 19, portMAX_DELAY);
+        trigger_screen_refresh();
+        if (ws_client && esp_websocket_client_is_connected(ws_client)) {
+            esp_websocket_client_send_text(ws_client, "{\"action\":\"played\"}", 19, portMAX_DELAY);
+        }
     }
     ESP_LOGI(TAG, "Playback completed! Remaining unread locally: %d", g_unread_count);
 }
@@ -714,9 +808,10 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                     if (type) {
                         if (strcmp(type->valuestring, "new_audio") == 0) {
                             has_new_message = true;
-                            gpio_set_level(LED_PIN, 0); // 亮灯
-                            // 本地实时计算信封排布并刷新
+                            // 保持克制与极低功耗：来消息时不常亮 LED 灯，仅由墨水屏画面呈现信封
                             trigger_screen_refresh();
+                            // 收到新语音通知时，立即在后台异步预下载音频到本地 PSRAM 缓存！
+                            start_preload_latest_audio();
                         } else if (strcmp(type->valuestring, "refresh_screen") == 0) {
                             trigger_screen_refresh();
                         }
@@ -994,10 +1089,12 @@ static void button_task(void *pvParameters) {
                     while (gpio_get_level(KEY_ENTER_PIN) == 0) {
                         vTaskDelay(pdMS_TO_TICKS(20));
                     }
-                    if (g_unread_count > 0) {
+                    // 智能播放与反复聆听支持：
+                    // 只要当前有未读信封，或者本地依然保留着上一条语音的缓存，孩子短按都能反复重听！
+                    if (g_unread_count > 0 || (g_preload_is_ready && g_preload_audio_len > 0)) {
                         play_latest_audio();
                     } else {
-                        // 无新留言时轻点短按，播放一声轻柔提示音，避免无谓的网络请求
+                        // 真正无任何留言时轻点短按，播放一声轻柔提示音
                         play_beep_tone(600, 40);
                     }
                 }
