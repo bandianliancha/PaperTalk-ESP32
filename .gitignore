@@ -1,0 +1,15 @@
+# 忽略本地敏感配置文件
+.env
+.DS_Store
+
+# Python 缓存与数据目录
+__pycache__/
+*.pyc
+data/
+
+# ESP-IDF 编译生成物
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
