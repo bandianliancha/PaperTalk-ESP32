@@ -51,7 +51,7 @@ static const char *TAG = "FEISHU_VOICE";
 #define KEY_UP_PIN     GPIO_NUM_39  // 侧上键 (低有效, 音量+)
 #define KEY_DOWN_PIN   GPIO_NUM_18  // 侧下键 (低有效, 音量-)
 
-static int g_current_volume = 80; // 默认 80% (范围: 60% ~ 100%)
+static int g_current_volume = 90; // 默认 90% (清脆适中，范围: 60% ~ 100%)
 
 // I2C
 #define I2C_SDA_PIN    GPIO_NUM_47
@@ -487,7 +487,7 @@ static void bsp_audio_init(void) {
         .sample_rate = 16000,
     };
     esp_codec_dev_open(play_dev, &fs);
-    esp_codec_dev_set_out_vol(play_dev, 80);
+    esp_codec_dev_set_out_vol(play_dev, g_current_volume);
     esp_codec_dev_set_in_gain(record_dev, 30.0);
 
     ESP_LOGI(TAG, "Audio ES8311 initialized successfully!");

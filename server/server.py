@@ -451,8 +451,12 @@ def download_feishu_resource(message_id: str, file_key: str, dest_path: Path):
         return False
 
 def convert_to_wav(src_path: Path, dst_wav_path: Path):
+    # 使用 loudnorm 广播级响度均衡化 (EBU R128 标准)
+    # 无论是微弱的微信/飞书手机语音，还是不同距离的录音，自动将目标响度标准化至 -14 LUFS，
+    # 消除真实人声录音与高动态 TTS 合成语音之间的音量落差，确保孩子在墨水屏设备端听得清脆饱满！
     cmd = [
         "ffmpeg", "-y", "-i", str(src_path),
+        "-af", "loudnorm=I=-14:TP=-1.0:LRA=11",
         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
         str(dst_wav_path)
     ]
