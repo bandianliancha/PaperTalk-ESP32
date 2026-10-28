@@ -6,6 +6,12 @@ import math
 import asyncio
 import logging
 import subprocess
+import sqlite3
+import threading
+import wave
+import array
+import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 from datetime import datetime
 from aiohttp import web
@@ -32,7 +38,7 @@ APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 DEFAULT_OPEN_ID = os.environ.get("DEFAULT_OPEN_ID", "")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.environ.get("VOICE_DATA_DIR", BASE_DIR / "data"))
 DATA_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
@@ -42,8 +48,25 @@ device_ws_clients = set()
 current_open_id = DEFAULT_OPEN_ID
 latest_epd_img_path = DATA_DIR / "screen.bin"
 
-# 未读消息队列：FIFO 结构
-unread_messages = []
+# 持久化消息 ID，避免飞书重投递或服务重启后重复入队。
+message_lock = threading.RLock()
+message_db = sqlite3.connect(DATA_DIR / "messages.sqlite3", check_same_thread=False)
+message_db.execute("CREATE TABLE IF NOT EXISTS messages (msg_id TEXT PRIMARY KEY, audio_path TEXT, text TEXT, timestamp INTEGER, status TEXT NOT NULL, message_type TEXT, content TEXT, sender_id TEXT)")
+message_db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+columns = {row[1] for row in message_db.execute("PRAGMA table_info(messages)")}
+for column in ("message_type", "content", "sender_id"):
+    if column not in columns:
+        message_db.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
+# Older interrupted reservations have no event payload and cannot be recovered.
+message_db.execute("DELETE FROM messages WHERE status='processing' AND content IS NULL")
+message_db.commit()
+saved_recipient = message_db.execute("SELECT value FROM metadata WHERE key='recipient'").fetchone()
+if saved_recipient:
+    current_open_id = saved_recipient[0]
+unread_messages = [dict(zip(("msg_id", "audio_path", "text", "timestamp"), row)) for row in
+    message_db.execute("SELECT msg_id, audio_path, text, timestamp FROM messages WHERE status = 'ready' ORDER BY rowid")]
+for item in unread_messages:
+    item["audio_path"] = Path(item["audio_path"])
 
 # 设备状态
 device_state = {
@@ -62,6 +85,8 @@ lark_client = lark.Client.builder() \
     .build()
 
 executor = ThreadPoolExecutor(max_workers=4)
+message_executor = ThreadPoolExecutor(max_workers=1)
+reaction_executor = ThreadPoolExecutor(max_workers=1)
 server_loop = None
 
 def get_font(size):
@@ -450,34 +475,67 @@ def download_feishu_resource(message_id: str, file_key: str, dest_path: Path):
         logger.error(f"Failed to download resource: {r.status_code} {r.text}")
         return False
 
-def convert_to_wav(src_path: Path, dst_wav_path: Path):
-    # 彻底移除 silenceremove 激进切除逻辑，避免吞字切字！
-    # 采用高保真直转，配合 loudnorm 响度均衡化 (EBU R128 标准)，
-    # 完整保留语音开头和结尾的每一个字与呼吸细节，音质 100% 完整！
-    cmd = [
-        "ffmpeg", "-y", "-i", str(src_path),
-        "-af", "loudnorm=I=-14:TP=-1.0:LRA=11",
-        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-        str(dst_wav_path)
-    ]
+def trim_silence(wav_path: Path):
+    """Trim only the edges; preserve quiet consonants with generous padding."""
+    with wave.open(str(wav_path), "rb") as source:
+        params = source.getparams()
+        if (params.nchannels, params.sampwidth, params.framerate) != (1, 2, 16000):
+            raise ValueError("Expected 16 kHz mono PCM")
+        pcm = source.readframes(params.nframes)
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    window = 800  # 50 ms RMS smooths out individual noise spikes
+    levels = []
+    for offset in range(0, len(samples), window):
+        chunk = samples[offset:offset + window]
+        if chunk:
+            levels.append((offset, math.sqrt(sum(value * value for value in chunk) / len(chunk))))
+    # Estimate a quiet background level from the recording itself. Only adapt
+    # if there is a clear louder signal, and cap the threshold conservatively.
+    threshold = 32768 * 10 ** (-48 / 20)
+    if len(levels) >= 10:
+        ordered = sorted(level for _, level in levels)
+        noise_floor = ordered[len(ordered) // 5]
+        if noise_floor > threshold and ordered[-1] > noise_floor * 8:
+            threshold = min(32768 * 10 ** (-32 / 20), noise_floor * 1.8)
+    active = [offset for offset, rms in levels if rms >= threshold]
+    if not active:
+        logger.info("Audio has no detected speech; keeping original to avoid deleting quiet speech")
+        return
+    start = max(0, active[0] - int(0.25 * params.framerate))
+    end = min(len(samples), active[-1] + window + int(0.25 * params.framerate))
+    with wave.open(str(wav_path), "wb") as output:
+        output.setparams(params)
+        output.writeframes(pcm[start * 2:end * 2])
+    logger.info("Trimmed audio edges: %.2fs start, %.2fs end", start / params.framerate,
+                (len(samples) - end) / params.framerate)
+
+def convert_to_wav(src_path: Path, dst_wav_path: Path, denoise: bool = False):
+    filters = []
+    if denoise:
+        # Reduce steady background noise; do not claim to separate all non-speech sounds.
+        filters.extend(["highpass=f=70", "afftdn=nf=-48:nr=10"])
+    filters.append("loudnorm=I=-14:TP=-1.0:LRA=11")
+    cmd = ["ffmpeg", "-y", "-i", str(src_path), "-af", ",".join(filters),
+           "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(dst_wav_path)]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    trim_silence(dst_wav_path)
 
 def convert_to_opus(src_wav: Path, dst_opus: Path):
-    # 彻底移除 silenceremove，绝不误切孩子的开头第一个字！
-    # 仅保留纯净人声滤波与环境降噪，完整保留每一个字：
-    cmd = [
-        "ffmpeg", "-y", "-i", str(src_wav),
-        "-af", "highpass=f=100,lowpass=f=4000,afftdn=nf=-45:nr=18,loudnorm=I=-14:TP=-1.0:LRA=11",
-        "-c:a", "libopus", "-b:a", "16k", "-ar", "16000", "-ac", "1",
-        str(dst_opus)
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    with tempfile.NamedTemporaryFile(suffix=".wav", dir=DATA_DIR) as temp:
+        cleaned = Path(temp.name)
+        convert_to_wav(src_wav, cleaned, denoise=True)
+        cmd = ["ffmpeg", "-y", "-i", str(cleaned), "-c:a", "libopus", "-b:a", "16k",
+               "-ar", "16000", "-ac", "1", str(dst_opus)]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 def upload_and_send_voice_to_feishu(wav_path: Path, open_id: str):
     opus_path = wav_path.with_suffix(".opus")
     convert_to_opus(wav_path, opus_path)
     
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(wav_path)]
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(opus_path)]
     try:
         dur_s = float(subprocess.check_output(cmd).decode().strip())
         dur_ms = int(dur_s * 1000)
@@ -561,87 +619,80 @@ def check_and_notify_battery(batt_pct, charging):
         send_feishu_text(current_open_id, text)
 
 # --- Feishu Event Handler ---
+def queue_snapshot():
+    with message_lock:
+        return {"unread_count": len(unread_messages),
+                "head_id": unread_messages[0]["msg_id"] if unread_messages else ""}
+
+async def broadcast_queue():
+    await notify_device({"type": "queue_state", **queue_snapshot()})
+
 def on_feishu_message(data: lark.im.v1.P2ImMessageReceiveV1):
-    global current_open_id, server_loop
+    # Return promptly so Feishu can acknowledge the event before TTS/network work.
     msg = data.event.message
     sender = data.event.sender
-    current_open_id = sender.sender_id.open_id
-    msg_id = msg.message_id
-    logger.info(f"Received Feishu message: type={msg.message_type}, from={current_open_id}, msg_id={msg_id}")
-
-    if msg.message_type == "audio":
-        content = json.loads(msg.content)
-        file_key = content.get("file_key")
-        tmp_download = DATA_DIR / f"{file_key}.audio"
-        msg_wav_path = DATA_DIR / f"msg_{msg_id}.wav"
-        logger.info(f"Downloading voice file_key: {file_key}")
-        if download_feishu_resource(msg.message_id, file_key, tmp_download):
-            convert_to_wav(tmp_download, msg_wav_path)
-            logger.info("Voice converted to 16kHz mono WAV successfully!")
-            
-            unread_messages.append({
-                "msg_id": msg_id,
-                "audio_path": msg_wav_path,
-                "text": "语音留言",
-                "timestamp": int(time.time())
-            })
-
-            render_child_screen("new_message")
-
-            try:
-                fut = asyncio.run_coroutine_threadsafe(
-                    notify_device({
-                        "type": "new_audio",
-                        "unread_count": len(unread_messages),
-                        "url": "/api/audio/latest.wav",
-                        "screen_url": "/api/screen/latest.bin",
-                        "timestamp": int(time.time()),
-                        "message_id": msg_id
-                    }),
-                    server_loop
-                )
-                delivered = fut.result(timeout=5)
-                if delivered:
-                    clear_and_set_message_reaction(msg_id, "CheckMark")
-            except Exception as e:
-                logger.error(f"Failed to notify device: {e}")
-
-    elif msg.message_type == "text":
-        content = json.loads(msg.content)
-        text = content.get("text", "")
-        logger.info(f"Text message: {text}")
-
-        msg_wav_path = DATA_DIR / f"msg_{msg_id}.wav"
+    sender_id = getattr(getattr(sender, "sender_id", None), "open_id", None)
+    sender_type = getattr(sender, "sender_type", None)
+    if sender_type != "user" or not sender_id or msg.message_type not in ("text", "audio") or not msg.message_id:
+        logger.info("Ignoring non-user or unsupported Feishu message: sender_type=%s type=%s", sender_type, msg.message_type)
+        return
+    with message_lock:
         try:
-            fut = executor.submit(sync_generate_tts, text, msg_wav_path)
-            fut.result(timeout=10)
-            logger.info("Text-to-Speech generated WAV successfully!")
+            message_db.execute("INSERT INTO messages (msg_id, status, message_type, content, sender_id) VALUES (?, 'processing', ?, ?, ?)", (msg.message_id, msg.message_type, msg.content, sender_id))
+            message_db.commit()
+        except sqlite3.IntegrityError:
+            logger.info("Ignoring duplicate Feishu message %s", msg.message_id)
+            return
+    message_executor.submit(process_feishu_message, msg, sender_id)
 
-            unread_messages.append({
-                "msg_id": msg_id,
-                "audio_path": msg_wav_path,
-                "text": text,
-                "timestamp": int(time.time())
-            })
+def process_feishu_message(msg, sender_id):
+    global current_open_id
+    msg_id = msg.message_id
+    msg_wav_path = DATA_DIR / f"msg_{msg_id}.wav"
+    committed = False
+    try:
+        content = json.loads(msg.content)
+        if msg.message_type == "audio":
+            file_key = content.get("file_key")
+            if not file_key:
+                raise ValueError("Audio message has no file_key")
+            tmp_download = DATA_DIR / f"{file_key}.audio"
+            if not download_feishu_resource(msg_id, file_key, tmp_download):
+                raise RuntimeError("Audio download failed")
+            convert_to_wav(tmp_download, msg_wav_path, denoise=True)
+            text = "语音留言"
+        else:
+            text = content.get("text", "").strip()
+            if not text:
+                raise ValueError("Empty text message")
+            sync_generate_tts(text, msg_wav_path)
+        item = {"msg_id": msg_id, "audio_path": msg_wav_path, "text": text, "timestamp": int(time.time())}
+        with message_lock:
+            message_db.execute("UPDATE messages SET audio_path=?, text=?, timestamp=?, status='ready' WHERE msg_id=?",
+                               (str(msg_wav_path), text, item["timestamp"], msg_id))
+            message_db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('recipient', ?)", (sender_id,))
+            message_db.commit()
+            unread_messages.append(item)
+            current_open_id = sender_id
+            committed = True
+        logger.info("Queued Feishu message %s; unread=%s", msg_id, queue_snapshot()["unread_count"])
+        if server_loop:
+            asyncio.run_coroutine_threadsafe(broadcast_queue(), server_loop)
+        reaction_executor.submit(clear_and_set_message_reaction, msg_id, "CheckMark")
+    except Exception:
+        logger.exception("Failed to process Feishu message %s", msg_id)
+        # Once committed, a notification failure must never enqueue it again.
+        if not committed:
+            # Keep the event on disk and retry; the event callback has already returned.
+            retry = threading.Timer(15, lambda: message_executor.submit(process_feishu_message, msg, sender_id))
+            retry.daemon = True
+            retry.start()
 
-            render_child_screen("new_message")
-
-            fut_notify = asyncio.run_coroutine_threadsafe(
-                notify_device({
-                    "type": "new_audio",
-                    "unread_count": len(unread_messages),
-                    "url": "/api/audio/latest.wav",
-                    "screen_url": "/api/screen/latest.bin",
-                    "timestamp": int(time.time()),
-                    "message_id": msg_id
-                }),
-                server_loop
-            )
-            delivered = fut_notify.result(timeout=5)
-            if delivered:
-                clear_and_set_message_reaction(msg_id, "CheckMark")
-        except Exception as e:
-            logger.error(f"TTS / notify failed: {e}")
+def recover_processing_messages():
+    with message_lock:
+        rows = message_db.execute("SELECT msg_id, message_type, content, sender_id FROM messages WHERE status='processing' ORDER BY rowid").fetchall()
+    for msg_id, message_type, content, sender_id in rows:
+        message_executor.submit(process_feishu_message, SimpleNamespace(message_id=msg_id, message_type=message_type, content=content), sender_id)
 
 def dummy_handler(data):
     pass
@@ -653,7 +704,7 @@ async def ws_handler(request):
     device_ws_clients.add(ws)
     logger.info(f"ESP32 device connected via WebSocket! (Total: {len(device_ws_clients)})")
     
-    await ws.send_str(json.dumps({"type": "connected", "msg": "Welcome to Feishu Bridge"}))
+    await ws.send_str(json.dumps({"type": "queue_state", **queue_snapshot()}))
 
     try:
         async for msg in ws:
@@ -679,22 +730,20 @@ async def ws_handler(request):
                         device_state["wifi_rssi"] = payload["rssi"]
 
                     if action == "played":
-                        if unread_messages:
-                            popped = unread_messages.pop(0)
-                            played_msg_id = popped["msg_id"]
-                            clear_and_set_message_reaction(played_msg_id, "HEART")
-                            logger.info(f"Message {played_msg_id} marked as played. Remaining unread: {len(unread_messages)}")
-
-                        if len(unread_messages) > 0:
-                            render_child_screen("new_message")
+                        played_msg_id = payload.get("message_id")
+                        removed = False
+                        with message_lock:
+                            if unread_messages and played_msg_id == unread_messages[0]["msg_id"]:
+                                message_db.execute("UPDATE messages SET status='played' WHERE msg_id=? AND status='ready'", (played_msg_id,))
+                                message_db.commit()
+                                unread_messages.pop(0)
+                                removed = True
+                        if removed:
+                            logger.info("Message %s marked played", played_msg_id)
+                            reaction_executor.submit(clear_and_set_message_reaction, played_msg_id, "HEART")
                         else:
-                            render_child_screen("idle")
-
-                        await notify_device({
-                            "type": "refresh_screen",
-                            "unread_count": len(unread_messages),
-                            "screen_url": "/api/screen/latest.bin"
-                        })
+                            logger.info("Ignoring stale or unidentified playback acknowledgement: %s", played_msg_id)
+                        await broadcast_queue()
 
                     elif action == "recording_start":
                         pass # 录音过程屏幕保持现状，不触发墨水屏刷新
@@ -714,14 +763,27 @@ async def ws_handler(request):
     return ws
 
 async def handle_get_audio(request):
-    if not unread_messages:
-        fallback_files = sorted(DATA_DIR.glob("msg_*.wav"), key=os.path.getmtime, reverse=True)
-        if fallback_files:
-            return web.FileResponse(fallback_files[0])
-        return web.Response(status=404, text="No audio available")
-    
-    current_item = unread_messages[0]
-    return web.FileResponse(current_item["audio_path"])
+    with message_lock:
+        if not unread_messages:
+            return web.Response(status=404, text="No unread audio")
+        return web.FileResponse(unread_messages[0]["audio_path"])
+
+async def handle_get_pcm(request):
+    msg_id = request.match_info["message_id"]
+    with message_lock:
+        item = next((item for item in unread_messages if item["msg_id"] == msg_id), None)
+        path = item["audio_path"] if item else None
+    if path is None:
+        return web.Response(status=404, text="Message not unread")
+    try:
+        with wave.open(str(path), "rb") as wav:
+            if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 16000):
+                raise ValueError("Unexpected audio format")
+            pcm = wav.readframes(wav.getnframes())
+        return web.Response(body=pcm, content_type="application/octet-stream")
+    except (OSError, wave.Error, ValueError):
+        logger.exception("Cannot read audio for %s", msg_id)
+        return web.Response(status=500, text="Invalid audio")
 
 async def handle_get_screen(request):
     if not latest_epd_img_path.exists():
@@ -739,17 +801,6 @@ async def handle_upload_audio(request):
         f.write(data)
     logger.info(f"Received {len(data)} bytes audio from ESP32. Saved to {upload_file}")
 
-    if len(unread_messages) > 0:
-        render_child_screen("new_message")
-    else:
-        render_child_screen("idle")
-
-    await notify_device({
-        "type": "refresh_screen",
-        "unread_count": len(unread_messages),
-        "screen_url": "/api/screen/latest.bin"
-    })
-
     if not current_open_id:
         return web.json_response({"status": "no_recipient", "msg": "Please send a message from Feishu first to pair"})
     
@@ -764,6 +815,7 @@ async def start_http_app():
     app = web.Application()
     app.router.add_get("/ws/device", ws_handler)
     app.router.add_get("/api/audio/latest.wav", handle_get_audio)
+    app.router.add_get("/api/audio/{message_id}.pcm", handle_get_pcm)
     app.router.add_get("/api/screen/latest.bin", handle_get_screen)
     app.router.add_post("/api/upload_audio", handle_upload_audio)
     runner = web.AppRunner(app)
@@ -790,6 +842,7 @@ def main():
     logger.info("Feishu WebSocket thread launched.")
 
     server_loop.run_until_complete(start_http_app())
+    recover_processing_messages()
     try:
         server_loop.run_forever()
     except KeyboardInterrupt:

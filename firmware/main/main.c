@@ -4,6 +4,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -148,7 +150,6 @@ static esp_codec_dev_handle_t play_dev = NULL;
 static esp_codec_dev_handle_t record_dev = NULL;
 static spi_device_handle_t epd_spi = NULL;
 
-static bool has_new_message = false;
 static uint8_t *epd_framebuffer = NULL; // 15000 bytes (400*300/8)
 
 // ── EPD 硬件 SPI 与底层指令 ─────────────────────────────────────
@@ -350,9 +351,25 @@ static void refresh_screen_locally(void) {
     int vol_level = (g_current_volume <= 60) ? 1 : ((g_current_volume >= 95) ? 3 : 2);
     int rssi = -55; // 默认良好
 
-    ESP_LOGI(TAG, "Rendering screen locally! unread=%d, batt=%d%%, vol=%d", g_unread_count, pct, vol_level);
-    canvas_render_ui(epd_framebuffer, g_unread_count, pct, chg, vol_level, rssi);
+    // A reconnect or repeated queue snapshot often requests an identical image.
+    // Avoid powering the panel and flashing it when nothing visible changed.
+    static bool shown = false;
+    static int last_unread, last_pct, last_volume;
+    static bool last_charging;
+    int unread = g_unread_count;
+    if (shown && unread == last_unread && pct == last_pct &&
+        vol_level == last_volume && chg == last_charging) {
+        ESP_LOGI(TAG, "Screen unchanged; skipping EPD refresh");
+        return;
+    }
+    ESP_LOGI(TAG, "Rendering screen locally! unread=%d, batt=%d%%, vol=%d", unread, pct, vol_level);
+    canvas_render_ui(epd_framebuffer, unread, pct, chg, vol_level, rssi);
     epd_refresh_display(epd_framebuffer);
+    shown = true;
+    last_unread = unread;
+    last_pct = pct;
+    last_volume = vol_level;
+    last_charging = chg;
 }
 
 static QueueHandle_t epd_task_queue = NULL;
@@ -491,166 +508,288 @@ static void bsp_audio_init(void) {
     // 调优麦克风前置模拟增益至 24.0dB（原 30.0dB 过度放大了电路板射频底噪）
     esp_codec_dev_set_in_gain(record_dev, 24.0);
 
-    ESP_LOGI(TAG, "Audio ES8311 initialized successfully!");
+    // The codec remains configured; stop I2S clocks while no sound is in use.
+    ESP_ERROR_CHECK(i2s_channel_disable(rx_handle));
+    ESP_ERROR_CHECK(i2s_channel_disable(tx_handle));
+    ESP_LOGI(TAG, "Audio ES8311 initialized; I2S clocks stopped while idle");
+}
+
+// Audio operations are serialized by button_task. Keep both channels active
+// for the entire play/record action, including prompts, and stop them afterward.
+static bool audio_session_begin(void) {
+    esp_err_t err = i2s_channel_enable(tx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot start I2S output: %s", esp_err_to_name(err));
+        return false;
+    }
+    err = i2s_channel_enable(rx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot start I2S input: %s", esp_err_to_name(err));
+        i2s_channel_disable(tx_handle);
+        return false;
+    }
+    return true;
+}
+
+static void audio_session_end(void) {
+    esp_err_t rx_err = i2s_channel_disable(rx_handle);
+    esp_err_t tx_err = i2s_channel_disable(tx_handle);
+    if (rx_err != ESP_OK || tx_err != ESP_OK)
+        ESP_LOGE(TAG, "Cannot stop I2S clocks: rx=%s tx=%s", esp_err_to_name(rx_err), esp_err_to_name(tx_err));
 }
 
 // ── 本地音频预缓存体系 (PSRAM 预下载 + 重复播放支持) ─────────────
-#define AUDIO_PRELOAD_MAX_BYTES (16000 * 2 * 60) // 最多支持 60 秒音频 (约 1.9MB)，Note4 具备 8MB PSRAM 绰绰有余
+#define AUDIO_PRELOAD_MAX_BYTES (16000 * 2 * 60)
+#define MESSAGE_ID_SIZE 96
 static uint8_t *g_preload_audio_buf = NULL;
 static size_t g_preload_audio_len = 0;
-static bool g_preload_is_ready = false;
+// The producer publishes only complete PCM bytes under g_audio_mutex.
+static uint8_t *g_loading_audio_buf = NULL;
+static size_t g_loading_audio_len = 0;
+static char g_loading_message_id[MESSAGE_ID_SIZE] = "";
+static char g_cached_message_id[MESSAGE_ID_SIZE] = "";
+static char g_head_message_id[MESSAGE_ID_SIZE] = "";
+static char g_pending_played_id[MESSAGE_ID_SIZE] = "";
 static bool g_preload_in_progress = false;
-static int g_current_audio_id = 0;
-static TaskHandle_t g_preload_task_handle = NULL;
+static SemaphoreHandle_t g_audio_mutex = NULL;
+static SemaphoreHandle_t g_preload_wifi_mutex = NULL;
+static esp_pm_lock_handle_t g_preload_pm_lock = NULL;
+static portMUX_TYPE g_message_lock = portMUX_INITIALIZER_UNLOCKED;
 
-static void preload_audio_task(void *pvParameters) {
-    g_preload_in_progress = true;
-    ESP_LOGI(TAG, "Background preloading latest audio from server...");
+static void send_played_ack(const char *message_id) {
+    if (!message_id[0] || !ws_client || !esp_websocket_client_is_connected(ws_client)) return;
+    char json[160];
+    snprintf(json, sizeof(json), "{\"action\":\"played\",\"message_id\":\"%s\"}", message_id);
+    esp_websocket_client_send_text(ws_client, json, strlen(json), pdMS_TO_TICKS(1000));
+}
 
-    char url[128];
-    snprintf(url, sizeof(url), "http://%s:%d/api/audio/latest.wav", g_server_host, g_server_port);
-
-    esp_http_client_config_t config = {
-        .url = url,
-        .timeout_ms = 8000,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Preload failed to open HTTP: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        g_preload_in_progress = false;
-        vTaskDelete(NULL);
-        return;
+static void preload_audio_task(void *unused) {
+    int64_t started = esp_timer_get_time();
+    xSemaphoreTake(g_preload_wifi_mutex, portMAX_DELAY);
+    esp_pm_lock_acquire(g_preload_pm_lock);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    while (true) {
+        char requested_id[MESSAGE_ID_SIZE];
+        portENTER_CRITICAL(&g_message_lock);
+        strlcpy(requested_id, g_head_message_id, sizeof(requested_id));
+        portEXIT_CRITICAL(&g_message_lock);
+        if (!requested_id[0]) {
+            portENTER_CRITICAL(&g_message_lock);
+            bool empty = !g_head_message_id[0];
+            if (empty) g_preload_in_progress = false;
+            portEXIT_CRITICAL(&g_message_lock);
+            if (empty) { esp_wifi_set_ps(WIFI_PS_MIN_MODEM); esp_pm_lock_release(g_preload_pm_lock); xSemaphoreGive(g_preload_wifi_mutex); vTaskDelete(NULL); return; }
+            continue;
+        }
+        char url[256];
+        snprintf(url, sizeof(url), "http://%s:%d/api/audio/%s.pcm", g_server_host, g_server_port, requested_id);
+        esp_http_client_config_t config = { .url = url, .timeout_ms = 8000 };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        uint8_t *buffer = NULL;
+        size_t total = 0;
+        bool ok = false;
+        if (client && esp_http_client_open(client, 0) == ESP_OK) {
+            ESP_LOGI(TAG, "Audio HTTP open after %lld ms", (esp_timer_get_time() - started) / 1000);
+            int64_t length = esp_http_client_fetch_headers(client);
+            ESP_LOGI(TAG, "Audio HTTP headers after %lld ms, bytes=%lld", (esp_timer_get_time() - started) / 1000, length);
+            if (esp_http_client_get_status_code(client) == 200 && length > 0 &&
+                length <= AUDIO_PRELOAD_MAX_BYTES && (length % 2) == 0) {
+                buffer = heap_caps_malloc((size_t)length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (buffer) {
+                    xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+                    g_loading_audio_buf = buffer;
+                    g_loading_audio_len = 0;
+                    strlcpy(g_loading_message_id, requested_id, sizeof(g_loading_message_id));
+                    xSemaphoreGive(g_audio_mutex);
+                    int r;
+                    while (total < length && (r = esp_http_client_read(client, (char *)buffer + total,
+                           length - total > 2048 ? 2048 : length - total)) > 0) {
+                        total += r;
+                        if (total == (size_t)r) ESP_LOGI(TAG, "First preload bytes arrived after %lld ms", (esp_timer_get_time() - started) / 1000);
+                        xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+                        g_loading_audio_len = total;
+                        xSemaphoreGive(g_audio_mutex);
+                    }
+                    ok = total == length;
+                }
+            }
+        }
+        char current_id[MESSAGE_ID_SIZE];
+        portENTER_CRITICAL(&g_message_lock);
+        strlcpy(current_id, g_head_message_id, sizeof(current_id));
+        portEXIT_CRITICAL(&g_message_lock);
+        xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+        if (ok && strcmp(current_id, requested_id) == 0) {
+            free(g_preload_audio_buf);
+            g_preload_audio_buf = buffer;
+            g_preload_audio_len = total;
+            strlcpy(g_cached_message_id, requested_id, sizeof(g_cached_message_id));
+            buffer = NULL;
+            ESP_LOGI(TAG, "Preloaded %s: %u bytes in %lld ms", requested_id, (unsigned)total,
+                     (esp_timer_get_time() - started) / 1000);
+        }
+        g_loading_audio_buf = NULL;
+        g_loading_audio_len = 0;
+        g_loading_message_id[0] = '\0';
+        xSemaphoreGive(g_audio_mutex);
+        free(buffer);
+        if (client) {
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+        }
+        portENTER_CRITICAL(&g_message_lock);
+        bool changed = strcmp(g_head_message_id, requested_id) != 0 && g_head_message_id[0];
+        if (!changed) g_preload_in_progress = false;
+        portEXIT_CRITICAL(&g_message_lock);
+        if (!changed) { esp_wifi_set_ps(WIFI_PS_MIN_MODEM); esp_pm_lock_release(g_preload_pm_lock); xSemaphoreGive(g_preload_wifi_mutex); vTaskDelete(NULL); return; }
     }
-
-    esp_http_client_fetch_headers(client);
-
-    if (!g_preload_audio_buf) {
-        g_preload_audio_buf = heap_caps_malloc(AUDIO_PRELOAD_MAX_BYTES, MALLOC_CAP_SPIRAM);
-    }
-
-    if (!g_preload_audio_buf) {
-        ESP_LOGE(TAG, "Failed to allocate PSRAM for audio preload!");
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        g_preload_in_progress = false;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    // 过滤掉 44 字节 WAV 头，直接在 PSRAM 里存纯 PCM 数据，播放时零耗时解头
-    int header_skip = 44;
-    char skip_buf[64];
-    while (header_skip > 0) {
-        int r = esp_http_client_read(client, skip_buf, header_skip > sizeof(skip_buf) ? sizeof(skip_buf) : header_skip);
-        if (r <= 0) break;
-        header_skip -= r;
-    }
-
-    size_t total_read = 0;
-    int r = 0;
-    while (total_read < AUDIO_PRELOAD_MAX_BYTES &&
-           (r = esp_http_client_read(client, (char *)g_preload_audio_buf + total_read, 2048)) > 0) {
-        total_read += r;
-    }
-
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-
-    g_preload_audio_len = total_read;
-    g_preload_is_ready = (total_read > 0);
+    portENTER_CRITICAL(&g_message_lock);
     g_preload_in_progress = false;
-    ESP_LOGI(TAG, "Audio preload finished! Size: %d bytes (ready=%d)", (int)total_read, g_preload_is_ready);
-
+    portEXIT_CRITICAL(&g_message_lock);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    esp_pm_lock_release(g_preload_pm_lock);
+    xSemaphoreGive(g_preload_wifi_mutex);
     vTaskDelete(NULL);
 }
 
 static void start_preload_latest_audio(void) {
-    if (g_preload_in_progress) {
-        ESP_LOGW(TAG, "Audio preload already in progress, skipping...");
-        return;
+    portENTER_CRITICAL(&g_message_lock);
+    bool start = g_head_message_id[0] && !g_preload_in_progress;
+    if (start) g_preload_in_progress = true;
+    portEXIT_CRITICAL(&g_message_lock);
+    if (start && xTaskCreatePinnedToCore(preload_audio_task, "audio_preload", 6144, NULL, 5, NULL, 1) != pdPASS) {
+        portENTER_CRITICAL(&g_message_lock);
+        g_preload_in_progress = false;
+        portEXIT_CRITICAL(&g_message_lock);
+        ESP_LOGE(TAG, "Could not start audio preload");
     }
-    g_preload_is_ready = false;
-    xTaskCreatePinnedToCore(preload_audio_task, "audio_preload", 4096, NULL, 5, &g_preload_task_handle, 1);
 }
 
-// ── 播放留言 (优先毫秒级直读本地 PSRAM 缓存，支持反复聆听) ──────
-static void play_latest_audio(void) {
-    ESP_LOGI(TAG, "Starting audio playback (preloaded=%d, len=%d)...", g_preload_is_ready, (int)g_preload_audio_len);
-
-    // 1. 如果后台预下载正好在进行中，稍等最多 500ms
-    int wait_cycles = 0;
-    while (g_preload_in_progress && wait_cycles < 25) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-        wait_cycles++;
-    }
-
-    // 预热防 Pop 破音：先给 I2S 喂一小段静音帧使 DAC 稳压，再开启功放
-    uint8_t zero_lead[128] = {0};
-    esp_codec_dev_write(play_dev, zero_lead, sizeof(zero_lead));
-
-    gpio_hold_dis(PA_CTRL_PIN);
-    gpio_set_level(PA_CTRL_PIN, 1); // 开启音频功放
-    gpio_hold_en(PA_CTRL_PIN);
-
-    // 2. 命中本地缓存：0 网络延迟极速播放！
-    if (g_preload_is_ready && g_preload_audio_buf && g_preload_audio_len > 0) {
-        ESP_LOGI(TAG, "Playing directly from local PSRAM buffer (Instant Start)!");
-        size_t offset = 0;
-        while (offset < g_preload_audio_len) {
-            size_t chunk = (g_preload_audio_len - offset > 2048) ? 2048 : (g_preload_audio_len - offset);
-            esp_codec_dev_write(play_dev, g_preload_audio_buf + offset, chunk);
-            offset += chunk;
+// Read a growing cache without holding the mutex during I2S writes. A failed
+// partial playback is never acknowledged as read or restarted from byte zero.
+static bool play_progressive_audio(const char *target_id, bool *wrote_any, int64_t started) {
+    uint8_t chunk[2048];
+    size_t offset = 0;
+    int64_t last_progress = esp_timer_get_time();
+    bool amplifier_on = false;
+    *wrote_any = false;
+    while (true) {
+        size_t amount = 0;
+        bool complete = false;
+        size_t buffered = 0;
+        xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+        const uint8_t *source = NULL;
+        size_t available = 0;
+        if (g_preload_audio_buf && strcmp(g_cached_message_id, target_id) == 0) {
+            source = g_preload_audio_buf;
+            available = g_preload_audio_len;
+            complete = true;
+        } else if (g_loading_audio_buf && strcmp(g_loading_message_id, target_id) == 0) {
+            source = g_loading_audio_buf;
+            available = g_loading_audio_len;
         }
-    } else {
-        // 3. Fallback 回退网络边下边播
-        ESP_LOGI(TAG, "Fallback to HTTP streaming playback...");
-        char url[128];
-        snprintf(url, sizeof(url), "http://%s:%d/api/audio/latest.wav", g_server_host, g_server_port);
+        buffered = available;
+        if (source && available > offset && (*wrote_any || complete || available >= 4096)) {
+            amount = available - offset;
+            if (amount > sizeof(chunk)) amount = sizeof(chunk);
+            amount &= ~(size_t)1; // PCM samples must stay aligned to 16 bits.
+            if (amount) memcpy(chunk, source + offset, amount);
+        }
+        bool finished = complete && offset == available && offset > 0;
+        xSemaphoreGive(g_audio_mutex);
+        if (finished) return true;
+        if (amount) {
+            if (!amplifier_on) {
+                gpio_hold_dis(PA_CTRL_PIN);
+                gpio_set_level(PA_CTRL_PIN, 1);
+                gpio_hold_en(PA_CTRL_PIN);
+                amplifier_on = true;
+                ESP_LOGI(TAG, "Progressive audio starts after %lld ms, buffered=%u complete=%d", (esp_timer_get_time() - started) / 1000, (unsigned)buffered, complete);
+            }
+            if (esp_codec_dev_write(play_dev, chunk, amount) != ESP_CODEC_DEV_OK) return false;
+            offset += amount;
+            *wrote_any = true;
+            last_progress = esp_timer_get_time();
+            continue;
+        }
+        bool loading;
+        portENTER_CRITICAL(&g_message_lock);
+        loading = g_preload_in_progress && strcmp(g_head_message_id, target_id) == 0;
+        portEXIT_CRITICAL(&g_message_lock);
+        if (!loading || esp_timer_get_time() - last_progress > 8000000) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
 
-        esp_http_client_config_t config = {
-            .url = url,
-            .timeout_ms = 5000,
-        };
+static void play_latest_audio(void) {
+    int64_t started = esp_timer_get_time();
+    char message_id[MESSAGE_ID_SIZE];
+    portENTER_CRITICAL(&g_message_lock);
+    strlcpy(message_id, g_head_message_id, sizeof(message_id));
+    portEXIT_CRITICAL(&g_message_lock);
+    bool unread = message_id[0] != '\0';
+    char target_id[MESSAGE_ID_SIZE];
+    strlcpy(target_id, message_id, sizeof(target_id));
+    if (!unread) {
+        xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+        strlcpy(target_id, g_cached_message_id, sizeof(target_id));
+        xSemaphoreGive(g_audio_mutex);
+    }
+    bool wrote_any = false;
+    bool played = target_id[0] && play_progressive_audio(target_id, &wrote_any, started);
+    bool cached = played || wrote_any;
+    if (!cached && unread) {
+        char url[256];
+        snprintf(url, sizeof(url), "http://%s:%d/api/audio/%s.pcm", g_server_host, g_server_port, message_id);
+        esp_http_client_config_t config = { .url = url, .timeout_ms = 5000 };
         esp_http_client_handle_t client = esp_http_client_init(&config);
-        if (esp_http_client_open(client, 0) == ESP_OK) {
-            esp_http_client_fetch_headers(client);
-            char *buf = malloc(1024);
-            int read_bytes = 0;
-            int header_skip = 44;
-            while (header_skip > 0) {
-                int r = esp_http_client_read(client, buf, header_skip > 1024 ? 1024 : header_skip);
-                if (r <= 0) break;
-                header_skip -= r;
+        if (client && esp_http_client_open(client, 0) == ESP_OK) {
+            int64_t length = esp_http_client_fetch_headers(client);
+            if (esp_http_client_get_status_code(client) == 200 && length > 0) {
+                char buffer[1024];
+                size_t total = 0;
+                int r;
+                uint8_t *replay = length <= AUDIO_PRELOAD_MAX_BYTES ?
+                    heap_caps_malloc((size_t)length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : NULL;
+                gpio_hold_dis(PA_CTRL_PIN);
+                gpio_set_level(PA_CTRL_PIN, 1);
+                gpio_hold_en(PA_CTRL_PIN);
+                played = true;
+                while (total < length && (r = esp_http_client_read(client, buffer, sizeof(buffer))) > 0) {
+                    if (total == 0) ESP_LOGI(TAG, "First streamed audio received after %lld ms", (esp_timer_get_time() - started) / 1000);
+                    if (esp_codec_dev_write(play_dev, buffer, r) != ESP_CODEC_DEV_OK) { played = false; break; }
+                    if (replay) memcpy(replay + total, buffer, r);
+                    total += r;
+                }
+                played = played && total == length;
+                if (played) {
+                    xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+                    free(g_preload_audio_buf);
+                    g_preload_audio_buf = replay;
+                    g_preload_audio_len = replay ? total : 0;
+                    strlcpy(g_cached_message_id, replay ? message_id : "", sizeof(g_cached_message_id));
+                    xSemaphoreGive(g_audio_mutex);
+                    replay = NULL;
+                }
+                free(replay);
+                ESP_LOGI(TAG, "Stream playback completed=%d bytes=%u", played, (unsigned)total);
             }
-            while ((read_bytes = esp_http_client_read(client, buf, 1024)) > 0) {
-                esp_codec_dev_write(play_dev, buf, read_bytes);
-            }
-            free(buf);
             esp_http_client_close(client);
         }
-        esp_http_client_cleanup(client);
+        if (client) esp_http_client_cleanup(client);
     }
-
     vTaskDelay(pdMS_TO_TICKS(100));
     gpio_hold_dis(PA_CTRL_PIN);
-    gpio_set_level(PA_CTRL_PIN, 0); // 关闭功放防底噪
+    gpio_set_level(PA_CTRL_PIN, 0);
     gpio_hold_en(PA_CTRL_PIN);
-
-    has_new_message = false;
-
-    // 4. 反复听逻辑支持：
-    // 若当前仍有未读信封，则听完后消减一封，并向服务端上报已读；
-    // 缓存 g_preload_audio_buf 并不清空，支持孩子在读完后反复按键重听！
-    if (g_unread_count > 0) {
-        g_unread_count--;
-        trigger_screen_refresh();
-        if (ws_client && esp_websocket_client_is_connected(ws_client)) {
-            esp_websocket_client_send_text(ws_client, "{\"action\":\"played\"}", -1, portMAX_DELAY);
-        }
+    if (played && unread) {
+        portENTER_CRITICAL(&g_message_lock);
+        strlcpy(g_pending_played_id, message_id, sizeof(g_pending_played_id));
+        portEXIT_CRITICAL(&g_message_lock);
+        send_played_ack(message_id);
+    } else if (!played) {
+        ESP_LOGW(TAG, "Playback failed; message remains unread");
     }
-    ESP_LOGI(TAG, "Playback completed! Remaining unread locally: %d", g_unread_count);
 }
 
 static void play_beep_tone(int freq_hz, int duration_ms);
@@ -795,6 +934,11 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         case WEBSOCKET_EVENT_CONNECTED:
             ESP_LOGI(TAG, "Connected to Feishu Bridge WebSocket!");
             send_device_status();
+            char pending[MESSAGE_ID_SIZE];
+            portENTER_CRITICAL(&g_message_lock);
+            strlcpy(pending, g_pending_played_id, sizeof(pending));
+            portEXIT_CRITICAL(&g_message_lock);
+            send_played_ack(pending);
             trigger_screen_refresh(); // 连上时刷新默认就绪画面
             break;
         case WEBSOCKET_EVENT_DATA:
@@ -807,19 +951,19 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                 if (root) {
                     cJSON *type = cJSON_GetObjectItem(root, "type");
                     cJSON *unread = cJSON_GetObjectItem(root, "unread_count");
-                    if (unread && cJSON_IsNumber(unread)) {
+                    cJSON *head = cJSON_GetObjectItem(root, "head_id");
+                    if (cJSON_IsString(type) && strcmp(type->valuestring, "queue_state") == 0 &&
+                        cJSON_IsNumber(unread) && cJSON_IsString(head)) {
+                        bool changed;
+                        portENTER_CRITICAL(&g_message_lock);
+                        changed = strcmp(g_head_message_id, head->valuestring) != 0;
+                        strlcpy(g_head_message_id, head->valuestring, sizeof(g_head_message_id));
+                        if (g_pending_played_id[0] && strcmp(g_pending_played_id, g_head_message_id) != 0)
+                            g_pending_played_id[0] = '\0';
                         g_unread_count = unread->valueint;
-                    }
-                    if (type) {
-                        if (strcmp(type->valuestring, "new_audio") == 0) {
-                            has_new_message = true;
-                            // 保持克制与极低功耗：来消息时不常亮 LED 灯，仅由墨水屏画面呈现信封
-                            trigger_screen_refresh();
-                            // 收到新语音通知时，立即在后台异步预下载音频到本地 PSRAM 缓存！
-                            start_preload_latest_audio();
-                        } else if (strcmp(type->valuestring, "refresh_screen") == 0) {
-                            trigger_screen_refresh();
-                        }
+                        portEXIT_CRITICAL(&g_message_lock);
+                        trigger_screen_refresh();
+                        if (changed && head->valuestring[0]) start_preload_latest_audio();
                     }
                     cJSON_Delete(root);
                 }
@@ -1089,18 +1233,24 @@ static void button_task(void *pvParameters) {
                 }
 
                 if (hold_time >= 300) {
-                    record_and_upload();
+                    if (audio_session_begin()) {
+                        record_and_upload();
+                        audio_session_end();
+                    }
                 } else {
                     while (gpio_get_level(KEY_ENTER_PIN) == 0) {
                         vTaskDelay(pdMS_TO_TICKS(20));
                     }
                     // 智能播放与反复聆听支持：
                     // 只要当前有未读信封，或者本地依然保留着上一条语音的缓存，孩子短按都能反复重听！
-                    if (g_unread_count > 0 || (g_preload_is_ready && g_preload_audio_len > 0)) {
-                        play_latest_audio();
-                    } else {
-                        // 真正无任何留言时轻点短按，播放一声轻柔提示音
-                        play_beep_tone(600, 40);
+                    ESP_LOGI(TAG, "Short press recognized (%d ms), unread=%d", hold_time, g_unread_count);
+                    if (audio_session_begin()) {
+                        if (g_unread_count > 0 || g_preload_audio_len > 0) {
+                            play_latest_audio();
+                        } else {
+                            play_beep_tone(600, 40);
+                        }
+                        audio_session_end();
                     }
                 }
             }
@@ -1115,7 +1265,10 @@ static void button_task(void *pvParameters) {
                     if (g_current_volume > 100) g_current_volume = 100;
                     esp_codec_dev_set_out_vol(play_dev, g_current_volume);
                     ESP_LOGI(TAG, "Volume UP -> %d%%", g_current_volume);
-                    play_beep_tone(800, 100); // 800Hz 提示音
+                    if (audio_session_begin()) {
+                        play_beep_tone(800, 100);
+                        audio_session_end();
+                    }
                     send_device_status();
                 }
                 while (gpio_get_level(KEY_UP_PIN) == 0) {
@@ -1133,7 +1286,10 @@ static void button_task(void *pvParameters) {
                     if (g_current_volume < 60) g_current_volume = 60; // 绝对不准低于 60%
                     esp_codec_dev_set_out_vol(play_dev, g_current_volume);
                     ESP_LOGI(TAG, "Volume DOWN -> %d%% (Safety Floor)", g_current_volume);
-                    play_beep_tone(500, 100); // 500Hz 低沉提示音
+                    if (audio_session_begin()) {
+                        play_beep_tone(500, 100);
+                        audio_session_end();
+                    }
                     send_device_status();
                 }
                 // 彻底吃掉长按，直到松手才退出，杜绝误触长按
@@ -1167,15 +1323,19 @@ void app_main(void) {
 
     // 初始化音频
     bsp_audio_init();
+    g_audio_mutex = xSemaphoreCreateMutex();
+    g_preload_wifi_mutex = xSemaphoreCreateMutex();
+    assert(g_audio_mutex && g_preload_wifi_mutex);
 
     // 启用动态电源管理 (Dynamic Frequency Scaling): 
     // 平时空闲时 CPU 从 240MHz 自动降至 40MHz，大幅降低芯片底噪与发热
     esp_pm_config_t pm_config = {
         .max_freq_mhz = 240,
         .min_freq_mhz = 40,
-        .light_sleep_enable = false // 维持 APB 和 WebSocket 时钟
+        .light_sleep_enable = true // Wi-Fi 在 DTIM 唤醒，I2S 使用期间持锁
     };
-    esp_pm_configure(&pm_config);
+    ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "audio_preload", &g_preload_pm_lock));
 
     // 连接 Wi-Fi
     wifi_init_sta();
@@ -1196,6 +1356,6 @@ void app_main(void) {
     esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)ws_client);
     esp_websocket_client_start(ws_client);
 
-    xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
+    xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);
     xTaskCreate(battery_monitor_task, "battery_monitor_task", 4096, NULL, 2, NULL);
 }
