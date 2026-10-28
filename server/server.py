@@ -463,8 +463,14 @@ def convert_to_wav(src_path: Path, dst_wav_path: Path):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 def convert_to_opus(src_wav: Path, dst_opus: Path):
+    # 设备端录音降噪与人声增强处理：
+    # 1. highpass=f=100: 滤除 100Hz 以下由于电路供电、手持摩擦引起的机械低频嗡嗡声
+    # 2. lowpass=f=4000: 滤除 4kHz 以上高频白噪声和底噪沙沙声
+    # 3. afftdn: FFT 频域动态频谱降噪，去除稳定的背景环境底噪
+    # 4. loudnorm: 确保孩子轻声说话时在飞书里依然清晰可闻
     cmd = [
         "ffmpeg", "-y", "-i", str(src_wav),
+        "-af", "highpass=f=100,lowpass=f=4000,afftdn=nf=-45:nr=18,loudnorm=I=-14:TP=-1.0:LRA=11",
         "-c:a", "libopus", "-b:a", "16k", "-ar", "16000", "-ac", "1",
         str(dst_opus)
     ]

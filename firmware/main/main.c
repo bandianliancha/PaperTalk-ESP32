@@ -488,7 +488,8 @@ static void bsp_audio_init(void) {
     };
     esp_codec_dev_open(play_dev, &fs);
     esp_codec_dev_set_out_vol(play_dev, g_current_volume);
-    esp_codec_dev_set_in_gain(record_dev, 30.0);
+    // 调优麦克风前置模拟增益至 24.0dB（原 30.0dB 过度放大了电路板射频底噪）
+    esp_codec_dev_set_in_gain(record_dev, 24.0);
 
     ESP_LOGI(TAG, "Audio ES8311 initialized successfully!");
 }
@@ -584,6 +585,10 @@ static void play_latest_audio(void) {
         vTaskDelay(pdMS_TO_TICKS(20));
         wait_cycles++;
     }
+
+    // 预热防 Pop 破音：先给 I2S 喂一小段静音帧使 DAC 稳压，再开启功放
+    uint8_t zero_lead[512] = {0};
+    esp_codec_dev_write(play_dev, zero_lead, sizeof(zero_lead));
 
     gpio_hold_dis(PA_CTRL_PIN);
     gpio_set_level(PA_CTRL_PIN, 1); // 开启音频功放
