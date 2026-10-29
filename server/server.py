@@ -53,6 +53,12 @@ message_lock = threading.RLock()
 message_db = sqlite3.connect(DATA_DIR / "messages.sqlite3", check_same_thread=False)
 message_db.execute("CREATE TABLE IF NOT EXISTS messages (msg_id TEXT PRIMARY KEY, audio_path TEXT, text TEXT, timestamp INTEGER, status TEXT NOT NULL, message_type TEXT, content TEXT, sender_id TEXT)")
 message_db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+message_db.execute("CREATE TABLE IF NOT EXISTS reply_sends (recording_id TEXT PRIMARY KEY, status TEXT NOT NULL)")
+reply_columns = {row[1] for row in message_db.execute("PRAGMA table_info(reply_sends)")}
+for column, sql_type in (("recipient", "TEXT"), ("file_key", "TEXT"), ("first_send_at", "INTEGER")):
+    if column not in reply_columns:
+        message_db.execute(f"ALTER TABLE reply_sends ADD COLUMN {column} {sql_type}")
+message_db.execute("UPDATE reply_sends SET status='unknown' WHERE status='sending'")
 columns = {row[1] for row in message_db.execute("PRAGMA table_info(messages)")}
 for column in ("message_type", "content", "sender_id"):
     if column not in columns:
@@ -531,7 +537,9 @@ def convert_to_opus(src_wav: Path, dst_opus: Path):
                "-ar", "16000", "-ac", "1", str(dst_opus)]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-def upload_and_send_voice_to_feishu(wav_path: Path, open_id: str):
+def upload_and_send_voice_to_feishu(wav_path: Path, open_id: str, recording_id: str = "", existing_file_key: str = ""):
+    if existing_file_key:
+        return send_voice_file_to_feishu(open_id, existing_file_key, recording_id)
     opus_path = wav_path.with_suffix(".opus")
     convert_to_opus(wav_path, opus_path)
     
@@ -552,7 +560,7 @@ def upload_and_send_voice_to_feishu(wav_path: Path, open_id: str):
             "duration": (None, str(dur_ms)),
             "file": ("voice.opus", f, "audio/opus")
         }
-        r = requests.post(upload_url, headers=headers, files=files)
+        r = requests.post(upload_url, headers=headers, files=files, timeout=20)
         res = r.json()
         if res.get("code") != 0:
             logger.error(f"Feishu file upload failed: {res}")
@@ -560,15 +568,26 @@ def upload_and_send_voice_to_feishu(wav_path: Path, open_id: str):
         file_key = res["data"]["file_key"]
         logger.info(f"Uploaded audio to Feishu file_key: {file_key}")
 
-    send_url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
-    body = {
-        "receive_id": open_id,
-        "msg_type": "audio",
-        "content": json.dumps({"file_key": file_key})
-    }
-    r = requests.post(send_url, headers=headers, json=body)
+    if recording_id:
+        with message_lock:
+            message_db.execute("UPDATE reply_sends SET file_key=? WHERE recording_id=?", (file_key, recording_id))
+            message_db.commit()
+    return send_voice_file_to_feishu(open_id, file_key, recording_id)
+
+def send_voice_file_to_feishu(open_id: str, file_key: str, recording_id: str = ""):
+    token = get_tenant_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    if recording_id:
+        with message_lock:
+            message_db.execute("UPDATE reply_sends SET first_send_at=COALESCE(first_send_at, ?) WHERE recording_id=?", (int(time.time()), recording_id))
+            message_db.commit()
+    send_url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
+    body = {"receive_id": open_id, "msg_type": "audio", "content": json.dumps({"file_key": file_key})}
+    if recording_id:
+        body["uuid"] = recording_id
+    r = requests.post(send_url, headers=headers, json=body, timeout=20)
     send_res = r.json()
-    logger.info(f"Send audio message result: {send_res}")
+    logger.info("Send audio message result: %s", send_res)
     return send_res.get("code") == 0
 
 def send_feishu_text(open_id, text):
@@ -646,6 +665,19 @@ def on_feishu_message(data: lark.im.v1.P2ImMessageReceiveV1):
     message_executor.submit(process_feishu_message, msg, sender_id)
 
 def process_feishu_message(msg, sender_id):
+    # Keep retries in the single worker, so later messages cannot overtake.
+    for attempt in range(3):
+        if process_feishu_message_once(msg, sender_id):
+            return
+        if attempt < 2:
+            time.sleep(5)
+    with message_lock:
+        message_db.execute("UPDATE messages SET status='failed' WHERE msg_id=? AND status='processing'", (msg.message_id,))
+        message_db.commit()
+    logger.error("Message %s failed after 3 attempts; retaining it for diagnosis", msg.message_id)
+    reaction_executor.submit(send_feishu_text, sender_id, "这条消息处理失败，设备未收到，请重新发送文字或语音。")
+
+def process_feishu_message_once(msg, sender_id):
     global current_open_id
     msg_id = msg.message_id
     msg_wav_path = DATA_DIR / f"msg_{msg_id}.wav"
@@ -679,14 +711,11 @@ def process_feishu_message(msg, sender_id):
         if server_loop:
             asyncio.run_coroutine_threadsafe(broadcast_queue(), server_loop)
         reaction_executor.submit(clear_and_set_message_reaction, msg_id, "CheckMark")
+        return True
     except Exception:
         logger.exception("Failed to process Feishu message %s", msg_id)
-        # Once committed, a notification failure must never enqueue it again.
-        if not committed:
-            # Keep the event on disk and retry; the event callback has already returned.
-            retry = threading.Timer(15, lambda: message_executor.submit(process_feishu_message, msg, sender_id))
-            retry.daemon = True
-            retry.start()
+        # If insertion already succeeded, never retry or enqueue twice.
+        return committed
 
 def recover_processing_messages():
     with message_lock:
@@ -794,22 +823,54 @@ async def handle_upload_audio(request):
     global current_open_id
     data = await request.read()
     if not data:
-        return web.json_response({"error": "Empty audio data"}, status=400)
-    
-    upload_file = DATA_DIR / f"child_record_{int(time.time())}.wav"
-    with open(upload_file, "wb") as f:
-        f.write(data)
-    logger.info(f"Received {len(data)} bytes audio from ESP32. Saved to {upload_file}")
-
+        return web.json_response({"status": "failed", "error": "Empty audio data"}, status=400)
+    recording_id = request.headers.get("X-Recording-ID", "")
+    if recording_id and (len(recording_id) > 50 or not recording_id.isalnum()):
+        return web.json_response({"status": "failed", "error": "Invalid recording ID"}, status=400)
     if not current_open_id:
-        return web.json_response({"status": "no_recipient", "msg": "Please send a message from Feishu first to pair"})
-    
-    loop = asyncio.get_event_loop()
-    success = await loop.run_in_executor(None, upload_and_send_voice_to_feishu, upload_file, current_open_id)
-    if success:
-        return web.json_response({"status": "ok", "msg": "Sent to Feishu"})
-    else:
-        return web.json_response({"status": "failed", "msg": "Upload to Feishu failed"}, status=500)
+        return web.json_response({"status": "failed", "msg": "No recipient"}, status=400)
+    existing_file_key = ""
+    was_unknown = False
+    recipient = current_open_id
+    if recording_id:
+        with message_lock:
+            row = message_db.execute("SELECT status, recipient, file_key, first_send_at FROM reply_sends WHERE recording_id=?", (recording_id,)).fetchone()
+            if row and row[0] == 'sent':
+                return web.json_response({"status": "ok"})
+            if row and row[0] == 'sending':
+                return web.json_response({"status": "unknown"}, status=202)
+            if row and row[0] == 'unknown':
+                if row[1] and not row[3]:
+                    # This version records first_send_at before any send, so
+                    # absence of that marker means retry has not sent a message.
+                    recipient = row[1]
+                    existing_file_key = row[2] or ""
+                elif row[1] and row[2] and row[3] and 0 <= time.time() - row[3] < 55 * 60:
+                    recipient, existing_file_key, was_unknown = row[1], row[2], True
+                else:
+                    return web.json_response({"status": "unknown"}, status=202)
+            elif row and row[1]:
+                recipient = row[1]
+            message_db.execute("INSERT INTO reply_sends (recording_id, status, recipient) VALUES (?, 'sending', ?) ON CONFLICT(recording_id) DO UPDATE SET status='sending'", (recording_id, recipient))
+            message_db.commit()
+    upload_file = DATA_DIR / (f"child_record_{recording_id}.wav" if recording_id else f"child_record_{time.time_ns()}.wav")
+    try:
+        upload_file.write_bytes(data)
+        loop = asyncio.get_running_loop()
+        success = await loop.run_in_executor(None, upload_and_send_voice_to_feishu, upload_file, recipient, recording_id, existing_file_key)
+        status = 'sent' if success else ('unknown' if was_unknown else 'failed')
+    except Exception:
+        logger.exception("Reply send outcome unknown for %s", recording_id)
+        status = 'unknown'
+    if recording_id:
+        with message_lock:
+            message_db.execute("UPDATE reply_sends SET status=? WHERE recording_id=?", (status, recording_id))
+            message_db.commit()
+    if status == 'sent':
+        return web.json_response({"status": "ok"})
+    if status == 'unknown':
+        return web.json_response({"status": "unknown"}, status=202)
+    return web.json_response({"status": "failed"}, status=500)
 
 async def start_http_app():
     app = web.Application()

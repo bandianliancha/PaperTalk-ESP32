@@ -11,6 +11,9 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "esp_spiffs.h"
+#include "esp_partition.h"
+#include <unistd.h>
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
@@ -53,7 +56,7 @@ static const char *TAG = "FEISHU_VOICE";
 #define KEY_UP_PIN     GPIO_NUM_39  // 侧上键 (低有效, 音量+)
 #define KEY_DOWN_PIN   GPIO_NUM_18  // 侧下键 (低有效, 音量-)
 
-static int g_current_volume = 90; // 默认 90% (清脆适中，范围: 60% ~ 100%)
+static int g_current_volume = 10; // 办公室调试初始音量；侧键可调整
 
 // I2C
 #define I2C_SDA_PIN    GPIO_NUM_47
@@ -131,7 +134,7 @@ static int read_battery_percent(bool *charging) {
     return p;
 }
 
-// 4.2" EPD (SSD1683 / 400x300)
+// NOTE4 4.2-inch EPD (400x300)
 #define EPD_PWR_PIN    GPIO_NUM_6
 #define EPD_BUSY_PIN   GPIO_NUM_8
 #define EPD_RST_PIN    GPIO_NUM_9
@@ -149,11 +152,15 @@ static i2s_chan_handle_t rx_handle = NULL;
 static esp_codec_dev_handle_t play_dev = NULL;
 static esp_codec_dev_handle_t record_dev = NULL;
 static spi_device_handle_t epd_spi = NULL;
+static esp_pm_lock_handle_t g_epd_pm_lock = NULL;
+static SemaphoreHandle_t g_epd_render_mutex = NULL;
 
 static uint8_t *epd_framebuffer = NULL; // 15000 bytes (400*300/8)
+static uint8_t *g_last_epd_image = NULL;
+static bool g_last_epd_valid = false;
 
 // ── EPD 硬件 SPI 与底层指令 ─────────────────────────────────────
-static void epd_wait_busy(const char *stage) {
+static esp_err_t epd_wait_busy(const char *stage) {
     vTaskDelay(pdMS_TO_TICKS(25)); // 硬件芯片响应延迟：必须先给SSD1683留出拉低BUSY的时间
     int waited = 0;
     while (gpio_get_level(EPD_BUSY_PIN) == 0) {
@@ -161,46 +168,53 @@ static void epd_wait_busy(const char *stage) {
         waited += 10;
         if (waited > 6000) {
             ESP_LOGE(TAG, "EPD busy timeout at stage: %s", stage);
-            break;
+            return ESP_ERR_TIMEOUT;
         }
     }
     ESP_LOGI(TAG, "EPD %s done (waited %d ms)", stage, waited);
+    return ESP_OK;
 }
 
-static void epd_send_cmd(uint8_t cmd) {
+static esp_err_t epd_send_cmd(uint8_t cmd) {
     gpio_set_level(EPD_DC_PIN, 0);
     gpio_set_level(EPD_CS_PIN, 0);
     spi_transaction_t t = {
         .length = 8,
         .tx_buffer = &cmd,
     };
-    spi_device_polling_transmit(epd_spi, &t);
+    esp_err_t err = spi_device_polling_transmit(epd_spi, &t);
     gpio_set_level(EPD_CS_PIN, 1);
+    return err;
 }
 
-static void epd_send_data(uint8_t data) {
+static esp_err_t epd_send_data(uint8_t data) {
     gpio_set_level(EPD_DC_PIN, 1);
     gpio_set_level(EPD_CS_PIN, 0);
     spi_transaction_t t = {
         .length = 8,
         .tx_buffer = &data,
     };
-    spi_device_polling_transmit(epd_spi, &t);
+    esp_err_t err = spi_device_polling_transmit(epd_spi, &t);
     gpio_set_level(EPD_CS_PIN, 1);
+    return err;
 }
 
-static void epd_write_bytes(const uint8_t *data, size_t len) {
+static esp_err_t epd_write_bytes(const uint8_t *data, size_t len) {
     gpio_set_level(EPD_DC_PIN, 1);
     gpio_set_level(EPD_CS_PIN, 0);
     spi_transaction_t t = {
         .length = 8 * len,
         .tx_buffer = data,
     };
-    spi_device_polling_transmit(epd_spi, &t);
+    esp_err_t err = spi_device_polling_transmit(epd_spi, &t);
     gpio_set_level(EPD_CS_PIN, 1);
+    return err;
 }
 
 static void epd_bsp_init(void) {
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "epd_refresh", &g_epd_pm_lock));
+    g_epd_render_mutex = xSemaphoreCreateMutex();
+    assert(g_epd_render_mutex);
     gpio_config_t epd_pins = {
         .pin_bit_mask = (1ULL << EPD_PWR_PIN) | (1ULL << EPD_RST_PIN) | (1ULL << EPD_DC_PIN) | (1ULL << EPD_CS_PIN),
         .mode = GPIO_MODE_OUTPUT,
@@ -237,11 +251,15 @@ static void epd_bsp_init(void) {
     if (!epd_framebuffer) {
         epd_framebuffer = malloc(15000);
     }
+    assert(epd_framebuffer);
+    g_last_epd_image = heap_caps_malloc(15000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_last_epd_image) g_last_epd_image = malloc(15000);
+    assert(g_last_epd_image);
     memset(epd_framebuffer, 0xFF, 15000);
     ESP_LOGI(TAG, "EPD SPI & Framebuffer initialized");
 }
 
-static void epd_power_init(void) {
+static esp_err_t epd_power_init(void) {
     gpio_hold_dis(EPD_PWR_PIN);
     gpio_set_level(EPD_PWR_PIN, 1);
     gpio_hold_en(EPD_PWR_PIN);
@@ -253,14 +271,14 @@ static void epd_power_init(void) {
     vTaskDelay(pdMS_TO_TICKS(30));
     gpio_set_level(EPD_RST_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(20));
-    epd_wait_busy("init_rst");
-
-    epd_send_cmd(0x00);
-    epd_send_data(0x2F);
-    epd_send_data(0x2E);
-    epd_send_cmd(0xE9);
-    epd_send_data(0x01);
-    epd_wait_busy("init_reg");
+    esp_err_t err = epd_wait_busy("init_rst");
+    if (err != ESP_OK) return err;
+    if ((err = epd_send_cmd(0x00)) != ESP_OK) return err;
+    if ((err = epd_send_data(0x2F)) != ESP_OK) return err;
+    if ((err = epd_send_data(0x2E)) != ESP_OK) return err;
+    if ((err = epd_send_cmd(0xE9)) != ESP_OK) return err;
+    if ((err = epd_send_data(0x01)) != ESP_OK) return err;
+    return epd_wait_busy("init_reg");
 }
 
 static void pack_1bpp_to_ssd1683(uint8_t in, uint8_t *out0, uint8_t *out1) {
@@ -274,102 +292,187 @@ static void pack_1bpp_to_ssd1683(uint8_t in, uint8_t *out0, uint8_t *out1) {
 }
 
 // 刷新整个墨水屏
-static void epd_refresh_display(const uint8_t *bitmap_1bpp) {
+static esp_err_t epd_refresh_display(const uint8_t *bitmap_1bpp) {
     ESP_LOGI(TAG, "Starting EPD refresh...");
-    epd_power_init();
+    esp_err_t err = esp_pm_lock_acquire(g_epd_pm_lock);
+    if (err != ESP_OK) return err;
+#define EPD_CHECK(call) do { err = (call); if (err != ESP_OK) goto cleanup; } while (0)
+    EPD_CHECK(epd_power_init());
 
     // 写入温度偏置（室温偏置 0xF1 = 241，SSD1683 驱动电子纸全刷必需）
-    epd_send_cmd(0xE0);
-    epd_send_data(0x02);
-    epd_send_cmd(0xE6);
-    epd_send_data(241);
+    EPD_CHECK(epd_send_cmd(0xE0));
+    EPD_CHECK(epd_send_data(0x02));
+    EPD_CHECK(epd_send_cmd(0xE6));
+    EPD_CHECK(epd_send_data(241));
 
     // 0xA5 Master Activation LUT
-    epd_send_cmd(0xA5);
-    epd_wait_busy("lut");
+    EPD_CHECK(epd_send_cmd(0xA5));
+    EPD_CHECK(epd_wait_busy("lut"));
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    epd_send_cmd(0x10);
+    EPD_CHECK(epd_send_cmd(0x10));
     uint8_t line[100]; // 50 bytes * 2
     for (int y = 0; y < 300; y++) {
         const uint8_t *src = bitmap_1bpp + y * 50;
         for (int xb = 0; xb < 50; xb++) {
             pack_1bpp_to_ssd1683(src[xb], &line[2 * xb], &line[2 * xb + 1]);
         }
-        epd_write_bytes(line, 100);
+        EPD_CHECK(epd_write_bytes(line, 100));
     }
 
     // Refresh & Power off
-    epd_send_cmd(0x04); // power on
-    epd_wait_busy("pwr_on");
-    epd_send_cmd(0x12); // display refresh
-    epd_send_data(0x00);
-    epd_wait_busy("display_refresh"); // 等待物理电泳颗粒迁移翻转完成(~3s)
-    epd_send_cmd(0x02); // power off
-    epd_send_data(0x00);
-    epd_wait_busy("pwr_off");
+    EPD_CHECK(epd_send_cmd(0x04)); // power on
+    EPD_CHECK(epd_wait_busy("pwr_on"));
+    EPD_CHECK(epd_send_cmd(0x12)); // display refresh
+    EPD_CHECK(epd_send_data(0x00));
+    EPD_CHECK(epd_wait_busy("display_refresh")); // 等待物理电泳颗粒迁移翻转完成(~3s)
+    EPD_CHECK(epd_send_cmd(0x02)); // power off
+    EPD_CHECK(epd_send_data(0x00));
+    EPD_CHECK(epd_wait_busy("pwr_off"));
 
+cleanup:
     gpio_hold_dis(EPD_PWR_PIN);
     gpio_set_level(EPD_PWR_PIN, 0); // 彻底断开 EPD 供电进入极低功耗
     gpio_hold_en(EPD_PWR_PIN);
-    ESP_LOGI(TAG, "EPD refresh done!");
-}
-
-static void fetch_and_refresh_screen(void) {
-    char url[128];
-    snprintf(url, sizeof(url), "http://%s:%d/api/screen/latest.bin", g_server_host, g_server_port);
-    esp_http_client_config_t config = {
-        .url = url,
-        .timeout_ms = 5000,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err == ESP_OK) {
-        int content_len = esp_http_client_fetch_headers(client);
-        if (content_len == 15000) {
-            int total_read = 0;
-            while (total_read < 15000) {
-                int r = esp_http_client_read(client, (char *)epd_framebuffer + total_read, 15000 - total_read);
-                if (r <= 0) break;
-                total_read += r;
-            }
-            if (total_read == 15000) {
-                epd_refresh_display(epd_framebuffer);
-            }
-        }
-    }
-    esp_http_client_cleanup(client);
+    esp_pm_lock_release(g_epd_pm_lock);
+    if (err == ESP_OK) ESP_LOGI(TAG, "EPD refresh done!");
+    else ESP_LOGE(TAG, "EPD refresh failed: %s", esp_err_to_name(err));
+#undef EPD_CHECK
+    return err;
 }
 
 #include "local_canvas.h"
+#include "status_assets.h"
+
+typedef enum { REPLY_IDLE, REPLY_SENDING, REPLY_FAILED, REPLY_UNKNOWN } reply_status_t;
+static volatile reply_status_t g_reply_status = REPLY_IDLE;
+static uint8_t *g_reply_buf = NULL;
+static size_t g_reply_size = 0;
+static char g_reply_id[33];
+static bool g_reply_storage_ready = false, g_reply_persisted = false;
+#define REPLY_FILE "/reply/pending.bin"
+#define REPLY_TEMP "/reply/pending.tmp"
+#define SAVED_REPLY_MAGIC 0x52504c59
+typedef struct { uint32_t magic, length; char id[33]; } saved_reply_header_t;
+
+// Never format an existing partition unless every byte is erased.
+static bool reply_storage_erased(void) {
+    const esp_partition_t *p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
+    if (!p) return false;
+    uint8_t block[512];
+    for (size_t off = 0; off < p->size; off += sizeof(block)) {
+        size_t n = p->size - off < sizeof(block) ? p->size - off : sizeof(block);
+        if (esp_partition_read(p, off, block, n) != ESP_OK) return false;
+        for (size_t i = 0; i < n; i++) if (block[i] != 0xff) return false;
+    }
+    return true;
+}
+
+static void reply_storage_init(void) {
+    esp_vfs_spiffs_conf_t conf = { .base_path = "/reply", .partition_label = "storage", .max_files = 3, .format_if_mount_failed = false };
+    esp_err_t err = esp_vfs_spiffs_register(&conf);
+    if (err != ESP_OK && reply_storage_erased()) {
+        conf.format_if_mount_failed = true;
+        err = esp_vfs_spiffs_register(&conf);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Reply storage unavailable, existing partition retained: %s", esp_err_to_name(err));
+        return;
+    }
+    g_reply_storage_ready = true;
+    FILE *f = fopen(REPLY_FILE, "rb");
+    bool from_temp = false;
+    if (!f) { f = fopen(REPLY_TEMP, "rb"); from_temp = f != NULL; }
+    if (!f) return;
+    saved_reply_header_t h;
+    if (fread(&h, 1, sizeof(h), f) != sizeof(h) || h.magic != SAVED_REPLY_MAGIC ||
+        h.length < 44 || h.length > 16000 * 2 * 15 + 44 || h.id[32] != 0 || strlen(h.id) != 32) {
+        ESP_LOGE(TAG, "Saved reply invalid; file preserved");
+        g_reply_storage_ready = false;
+        fclose(f); return;
+    }
+    uint8_t *buf = heap_caps_malloc(h.length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf || fread(buf, 1, h.length, f) != h.length) {
+        ESP_LOGE(TAG, "Could not load saved reply; file preserved");
+        g_reply_storage_ready = false;
+        free(buf); fclose(f); return;
+    }
+    fclose(f);
+    if (from_temp && rename(REPLY_TEMP, REPLY_FILE) != 0) {
+        ESP_LOGE(TAG, "Could not finalize saved reply; file preserved");
+        g_reply_storage_ready = false;
+        free(buf);
+        return;
+    }
+    g_reply_buf = buf; g_reply_size = h.length;
+    strlcpy(g_reply_id, h.id, sizeof(g_reply_id));
+    g_reply_persisted = true; g_reply_status = REPLY_UNKNOWN;
+    ESP_LOGI(TAG, "Recovered saved reply");
+}
+
+static bool persist_reply(void) {
+    if (g_reply_persisted) return true;
+    if (!g_reply_storage_ready || !g_reply_buf) return false;
+    saved_reply_header_t h = { .magic = SAVED_REPLY_MAGIC, .length = g_reply_size };
+    strlcpy(h.id, g_reply_id, sizeof(h.id));
+    FILE *f = fopen(REPLY_TEMP, "wb");
+    if (!f) return false;
+    bool ok = fwrite(&h, 1, sizeof(h), f) == sizeof(h) &&
+              fwrite(g_reply_buf, 1, g_reply_size, f) == g_reply_size &&
+              fflush(f) == 0 && fsync(fileno(f)) == 0;
+    if (fclose(f) != 0) ok = false;
+    if (ok) ok = rename(REPLY_TEMP, REPLY_FILE) == 0;
+    if (ok) g_reply_persisted = true;
+    return ok;
+}
+
+static bool remove_saved_reply(void) {
+    if (!g_reply_persisted) return true;
+    if (remove(REPLY_FILE) != 0) return false;
+    g_reply_persisted = false;
+    return true;
+}
 
 static int g_unread_count = 0;
 
-static void refresh_screen_locally(void) {
+static esp_err_t refresh_screen_locally(void) {
     bool chg = false;
     int pct = read_battery_percent(&chg);
     int vol_level = (g_current_volume <= 60) ? 1 : ((g_current_volume >= 95) ? 3 : 2);
-    int rssi = -55; // 默认良好
-
-    // A reconnect or repeated queue snapshot often requests an identical image.
-    // Avoid powering the panel and flashing it when nothing visible changed.
-    static bool shown = false;
-    static int last_unread, last_pct, last_volume;
-    static bool last_charging;
     int unread = g_unread_count;
-    if (shown && unread == last_unread && pct == last_pct &&
-        vol_level == last_volume && chg == last_charging) {
-        ESP_LOGI(TAG, "Screen unchanged; skipping EPD refresh");
-        return;
-    }
     ESP_LOGI(TAG, "Rendering screen locally! unread=%d, batt=%d%%, vol=%d", unread, pct, vol_level);
-    canvas_render_ui(epd_framebuffer, unread, pct, chg, vol_level, rssi);
-    epd_refresh_display(epd_framebuffer);
-    shown = true;
-    last_unread = unread;
-    last_pct = pct;
-    last_volume = vol_level;
-    last_charging = chg;
+    xSemaphoreTake(g_epd_render_mutex, portMAX_DELAY);
+    reply_status_t status = g_reply_status;
+    if (status == REPLY_IDLE) {
+        canvas_render_ui(epd_framebuffer, unread, pct, chg, vol_level, -55);
+    } else {
+        memset(epd_framebuffer, 0xff, 15000);
+        const uint8_t *label = status == REPLY_SENDING ? status_sending :
+                               status == REPLY_FAILED ? status_failed : status_uncertain;
+        if (status == REPLY_SENDING) {
+            for (int y = 0; y < 180; y++)
+                memcpy(epd_framebuffer + (60 + y) * 50 + 5, label + y * 40, 40);
+        } else {
+            for (int y = 0; y < 60; y++) {
+                memcpy(epd_framebuffer + (100 + y) * 50 + 5, label + y * 40, 40);
+                memcpy(epd_framebuffer + (170 + y) * 50 + 5, status_caption + y * 40, 40);
+            }
+        }
+    }
+    esp_err_t err = ESP_OK;
+    if (g_last_epd_valid && memcmp(epd_framebuffer, g_last_epd_image, 15000) == 0) {
+        ESP_LOGI(TAG, "Screen image unchanged; no refresh needed");
+    } else {
+        err = epd_refresh_display(epd_framebuffer);
+        if (err == ESP_OK) {
+            memcpy(g_last_epd_image, epd_framebuffer, 15000);
+            g_last_epd_valid = true;
+        } else {
+            g_last_epd_valid = false;
+        }
+    }
+    xSemaphoreGive(g_epd_render_mutex);
+    return err;
 }
 
 static QueueHandle_t epd_task_queue = NULL;
@@ -379,7 +482,11 @@ static void epd_refresh_task(void *pvParameters) {
     while (1) {
         if (xQueueReceive(epd_task_queue, &dummy, portMAX_DELAY) == pdTRUE) {
             ESP_LOGI(TAG, "Worker task refreshing screen from local canvas...");
-            refresh_screen_locally();
+            for (int attempt = 0; attempt < 3; attempt++) {
+                if (refresh_screen_locally() == ESP_OK) break;
+                ESP_LOGW(TAG, "Screen refresh failed, attempt %d/3", attempt + 1);
+                vTaskDelay(pdMS_TO_TICKS(250));
+            }
         }
     }
 }
@@ -387,7 +494,7 @@ static void epd_refresh_task(void *pvParameters) {
 static void trigger_screen_refresh(void) {
     if (epd_task_queue) {
         uint8_t dummy = 1;
-        xQueueSend(epd_task_queue, &dummy, 0);
+        xQueueOverwrite(epd_task_queue, &dummy);
     }
 }
 
@@ -563,6 +670,17 @@ static void send_played_ack(const char *message_id) {
     esp_websocket_client_send_text(ws_client, json, strlen(json), pdMS_TO_TICKS(1000));
 }
 
+static void played_ack_retry_task(void *unused) {
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        char pending[MESSAGE_ID_SIZE];
+        portENTER_CRITICAL(&g_message_lock);
+        strlcpy(pending, g_pending_played_id, sizeof(pending));
+        portEXIT_CRITICAL(&g_message_lock);
+        if (pending[0]) send_played_ack(pending);
+    }
+}
+
 static void preload_audio_task(void *unused) {
     int64_t started = esp_timer_get_time();
     xSemaphoreTake(g_preload_wifi_mutex, portMAX_DELAY);
@@ -665,15 +783,38 @@ static void start_preload_latest_audio(void) {
     }
 }
 
+// During playback, short press toggles pause; long press interrupts for recording.
+static bool playback_control(bool *paused) {
+    do {
+        if (gpio_get_level(KEY_ENTER_PIN) == 0) {
+            int held = 0;
+            while (gpio_get_level(KEY_ENTER_PIN) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                held += 20;
+                if (held >= 300) return true;
+            }
+            if (held >= 20) {
+                *paused = !*paused;
+                ESP_LOGI(TAG, "Playback %s", *paused ? "paused" : "resumed");
+            }
+        }
+        if (*paused) vTaskDelay(pdMS_TO_TICKS(20));
+    } while (*paused);
+    return false;
+}
+
 // Read a growing cache without holding the mutex during I2S writes. A failed
 // partial playback is never acknowledged as read or restarted from byte zero.
-static bool play_progressive_audio(const char *target_id, bool *wrote_any, int64_t started) {
+static bool play_progressive_audio(const char *target_id, bool *wrote_any, bool *interrupted, bool *paused, int64_t started) {
     uint8_t chunk[2048];
     size_t offset = 0;
     int64_t last_progress = esp_timer_get_time();
     bool amplifier_on = false;
     *wrote_any = false;
     while (true) {
+        int64_t control_started = esp_timer_get_time();
+        if (playback_control(paused)) { *interrupted = true; return false; }
+        last_progress += esp_timer_get_time() - control_started;
         size_t amount = 0;
         bool complete = false;
         size_t buffered = 0;
@@ -721,7 +862,9 @@ static bool play_progressive_audio(const char *target_id, bool *wrote_any, int64
     }
 }
 
-static void play_latest_audio(void) {
+static void play_beep_tone(int freq_hz, int duration_ms);
+
+static bool play_latest_audio(void) {
     int64_t started = esp_timer_get_time();
     char message_id[MESSAGE_ID_SIZE];
     portENTER_CRITICAL(&g_message_lock);
@@ -735,10 +878,10 @@ static void play_latest_audio(void) {
         strlcpy(target_id, g_cached_message_id, sizeof(target_id));
         xSemaphoreGive(g_audio_mutex);
     }
-    bool wrote_any = false;
-    bool played = target_id[0] && play_progressive_audio(target_id, &wrote_any, started);
+    bool wrote_any = false, interrupted = false, paused = false;
+    bool played = target_id[0] && play_progressive_audio(target_id, &wrote_any, &interrupted, &paused, started);
     bool cached = played || wrote_any;
-    if (!cached && unread) {
+    if (!cached && unread && !interrupted) {
         char url[256];
         snprintf(url, sizeof(url), "http://%s:%d/api/audio/%s.pcm", g_server_host, g_server_port, message_id);
         esp_http_client_config_t config = { .url = url, .timeout_ms = 5000 };
@@ -756,6 +899,7 @@ static void play_latest_audio(void) {
                 gpio_hold_en(PA_CTRL_PIN);
                 played = true;
                 while (total < length && (r = esp_http_client_read(client, buffer, sizeof(buffer))) > 0) {
+                    if (playback_control(&paused)) { interrupted = true; played = false; break; }
                     if (total == 0) ESP_LOGI(TAG, "First streamed audio received after %lld ms", (esp_timer_get_time() - started) / 1000);
                     if (esp_codec_dev_write(play_dev, buffer, r) != ESP_CODEC_DEV_OK) { played = false; break; }
                     if (replay) memcpy(replay + total, buffer, r);
@@ -787,12 +931,87 @@ static void play_latest_audio(void) {
         strlcpy(g_pending_played_id, message_id, sizeof(g_pending_played_id));
         portEXIT_CRITICAL(&g_message_lock);
         send_played_ack(message_id);
-    } else if (!played) {
+    } else if (!played && !interrupted) {
         ESP_LOGW(TAG, "Playback failed; message remains unread");
+        play_beep_tone(400, 120);
     }
+    return interrupted;
 }
 
 static void play_beep_tone(int freq_hz, int duration_ms);
+
+static void update_reply_status(reply_status_t status) {
+    g_reply_status = status;
+    trigger_screen_refresh();
+}
+
+static void send_retained_reply(void) {
+    if (!g_reply_buf) return;
+    if (g_reply_storage_ready && !persist_reply()) {
+        update_reply_status(REPLY_FAILED);
+        play_beep_tone(400, 120);
+        return;
+    }
+    if (!g_reply_storage_ready) ESP_LOGW(TAG, "Reply retained in memory only");
+    update_reply_status(REPLY_SENDING);
+    // Make the sending state visible before a fast request can complete.
+    refresh_screen_locally();
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/api/upload_audio", g_server_host, g_server_port);
+    esp_http_client_config_t config = { .url = url, .method = HTTP_METHOD_POST, .timeout_ms = 50000 };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_err_t err = ESP_FAIL;
+    int http_status = 0;
+    char response[192] = {0};
+    int received = 0;
+    if (client) {
+        esp_http_client_set_header(client, "Content-Type", "audio/wav");
+        esp_http_client_set_header(client, "X-Recording-ID", g_reply_id);
+        err = esp_http_client_open(client, g_reply_size);
+        if (err == ESP_OK) {
+            size_t sent = 0;
+            while (sent < g_reply_size) {
+                int n = esp_http_client_write(client, (const char *)g_reply_buf + sent, g_reply_size - sent);
+                if (n <= 0) { err = ESP_FAIL; break; }
+                sent += n;
+            }
+            if (err == ESP_OK) {
+                int64_t len = esp_http_client_fetch_headers(client);
+                if (len < 0) err = ESP_FAIL;
+                else {
+                    http_status = esp_http_client_get_status_code(client);
+                    received = esp_http_client_read_response(client, response, sizeof(response) - 1);
+                }
+            }
+        }
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+    }
+    if (received < 0) received = 0;
+    response[received] = 0;
+    cJSON *json = cJSON_Parse(response);
+    cJSON *status = json ? cJSON_GetObjectItem(json, "status") : NULL;
+    if (err == ESP_OK && http_status == 200 && cJSON_IsString(status) && !strcmp(status->valuestring, "ok")) {
+        if (!remove_saved_reply()) {
+            update_reply_status(REPLY_UNKNOWN);
+            cJSON_Delete(json);
+            return;
+        }
+        free(g_reply_buf);
+        g_reply_buf = NULL;
+        g_reply_size = 0;
+        update_reply_status(REPLY_IDLE);
+        play_beep_tone(900, 50);
+        play_beep_tone(600, 60);
+        ESP_LOGI(TAG, "Reply delivered");
+    } else {
+        bool failed = err == ESP_OK && cJSON_IsString(status) && !strcmp(status->valuestring, "failed");
+        update_reply_status(failed ? REPLY_FAILED : REPLY_UNKNOWN);
+        play_beep_tone(400, 120);
+        ESP_LOGW(TAG, "Reply not confirmed: http=%d err=%s; retained for retry", http_status, esp_err_to_name(err));
+    }
+    cJSON_Delete(json);
+}
 
 // ── 录音并上传 ─────────────────────────────────────────────────
 static void record_and_upload(void) {
@@ -831,9 +1050,6 @@ static void record_and_upload(void) {
         return;
     }
 
-    // 播放录音成功结束提示音：清脆对讲机下行送出音 (900Hz 50ms + 600Hz 60ms)
-    play_beep_tone(900, 50);
-    play_beep_tone(600, 60);
 
     ESP_LOGI(TAG, "Recording stopped. Uploading %d bytes...", recorded_pcm);
 
@@ -858,20 +1074,12 @@ static void record_and_upload(void) {
     memcpy(rec_buf + 36, "data", 4);
     memcpy(rec_buf + 40, &total_data_len, 4);
 
-    char url[128];
-    snprintf(url, sizeof(url), "http://%s:%d/api/upload_audio", g_server_host, g_server_port);
-    esp_http_client_config_t config = {
-        .url = url,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 10000,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_http_client_set_header(client, "Content-Type", "audio/wav");
-    esp_http_client_set_post_field(client, (const char *)rec_buf, recorded_pcm + 44);
-
-    esp_http_client_perform(client);
-    esp_http_client_cleanup(client);
-    free(rec_buf);
+    g_reply_buf = rec_buf;
+    g_reply_size = recorded_pcm + 44;
+    snprintf(g_reply_id, sizeof(g_reply_id), "%08lx%08lx%08lx%08lx",
+             (unsigned long)esp_random(), (unsigned long)esp_random(),
+             (unsigned long)esp_random(), (unsigned long)esp_random());
+    send_retained_reply();
 }
 
 static void send_device_status(void) {
@@ -1116,8 +1324,11 @@ static void start_provisioning_mode(void) {
     g_in_prov_mode = true;
     ESP_LOGW(TAG, "Entering Wi-Fi Provisioning (SoftAP) Mode...");
 
-    // 屏幕显示配网提示页面
+    // Provisioning replaces the current image; invalidate the last-frame cache.
+    xSemaphoreTake(g_epd_render_mutex, portMAX_DELAY);
+    g_last_epd_valid = false;
     epd_refresh_display(PROV_SCREEN_BITMAP);
+    xSemaphoreGive(g_epd_render_mutex);
 
     esp_wifi_stop();
     esp_netif_create_default_wifi_ap();
@@ -1232,7 +1443,20 @@ static void button_task(void *pvParameters) {
                     }
                 }
 
-                if (hold_time >= 300) {
+                if (g_reply_buf) {
+                    if (hold_time >= 300) {
+                        if (remove_saved_reply()) {
+                            free(g_reply_buf);
+                            g_reply_buf = NULL;
+                            g_reply_size = 0;
+                            update_reply_status(REPLY_IDLE);
+                        }
+                    } else if (audio_session_begin()) {
+                        send_retained_reply();
+                        audio_session_end();
+                    }
+                    while (gpio_get_level(KEY_ENTER_PIN) == 0) vTaskDelay(pdMS_TO_TICKS(20));
+                } else if (hold_time >= 300) {
                     if (audio_session_begin()) {
                         record_and_upload();
                         audio_session_end();
@@ -1246,7 +1470,7 @@ static void button_task(void *pvParameters) {
                     ESP_LOGI(TAG, "Short press recognized (%d ms), unread=%d", hold_time, g_unread_count);
                     if (audio_session_begin()) {
                         if (g_unread_count > 0 || g_preload_audio_len > 0) {
-                            play_latest_audio();
+                            if (play_latest_audio()) record_and_upload();
                         } else {
                             play_beep_tone(600, 40);
                         }
@@ -1277,15 +1501,15 @@ static void button_task(void *pvParameters) {
             }
         }
 
-        // 3. 侧下键 (KEY_DOWN_PIN, GPIO 18): 音量减 (安全下限死锁 60%, 屏蔽长按关机)
+        // 3. 侧下键 (KEY_DOWN_PIN, GPIO 18): 音量减至 10%，屏蔽长按关机
         if (gpio_get_level(KEY_DOWN_PIN) == 0) {
             vTaskDelay(pdMS_TO_TICKS(50));
             if (gpio_get_level(KEY_DOWN_PIN) == 0) {
-                if (g_current_volume > 60) {
+                if (g_current_volume > 10) {
                     g_current_volume -= 20;
-                    if (g_current_volume < 60) g_current_volume = 60; // 绝对不准低于 60%
+                    if (g_current_volume < 10) g_current_volume = 10;
                     esp_codec_dev_set_out_vol(play_dev, g_current_volume);
-                    ESP_LOGI(TAG, "Volume DOWN -> %d%% (Safety Floor)", g_current_volume);
+                    ESP_LOGI(TAG, "Volume DOWN -> %d%%", g_current_volume);
                     if (audio_session_begin()) {
                         play_beep_tone(500, 100);
                         audio_session_end();
@@ -1315,6 +1539,8 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    reply_storage_init();
+
     // 初始化电池监测 ADC
     bsp_battery_init();
 
@@ -1343,7 +1569,8 @@ void app_main(void) {
     ESP_LOGI(TAG, "WiFi connected!");
 
     // 创建墨水屏刷新独立任务
-    epd_task_queue = xQueueCreate(4, sizeof(uint8_t));
+    epd_task_queue = xQueueCreate(1, sizeof(uint8_t));
+    assert(epd_task_queue);
     xTaskCreate(epd_refresh_task, "epd_task", 8192, NULL, 3, NULL);
 
     // 启动 WebSocket
@@ -1356,6 +1583,7 @@ void app_main(void) {
     esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)ws_client);
     esp_websocket_client_start(ws_client);
 
+    xTaskCreate(played_ack_retry_task, "played_ack", 4096, NULL, 3, NULL);
     xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);
     xTaskCreate(battery_monitor_task, "battery_monitor_task", 4096, NULL, 2, NULL);
 }

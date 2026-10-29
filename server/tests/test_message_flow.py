@@ -98,6 +98,93 @@ class MessageFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server.queue_snapshot()['head_id'], 'om_recover')
         self.assertEqual(server.message_db.execute("SELECT status FROM messages WHERE msg_id='om_recover'").fetchone()[0], 'ready')
 
+    async def test_reply_retry_is_idempotent_and_uncertain_is_not_resent(self):
+        server.current_open_id = 'ou_test'
+        with patch.object(server, 'upload_and_send_voice_to_feishu', return_value=True) as send:
+            for _ in range(2):
+                response = await self.client.post('/api/upload_audio', data=b'voice', headers={'X-Recording-ID': 'abc123'})
+                self.assertEqual((await response.json())['status'], 'ok')
+            self.assertEqual(send.call_count, 1)
+        with server.message_lock:
+            server.message_db.execute("INSERT INTO reply_sends (recording_id,status) VALUES ('legacyunknown','unknown')")
+            server.message_db.commit()
+        with patch.object(server, 'upload_and_send_voice_to_feishu') as send:
+            response = await self.client.post('/api/upload_audio', data=b'voice', headers={'X-Recording-ID': 'legacyunknown'})
+            self.assertEqual((await response.json())['status'], 'unknown')
+            self.assertEqual(send.call_count, 0)
+
+    async def test_uncertain_send_recovers_with_same_uuid_inside_window(self):
+        server.current_open_id = 'ou_new'
+        with server.message_lock:
+            server.message_db.execute("INSERT INTO reply_sends (recording_id,status,recipient,file_key,first_send_at) VALUES (?,?,?,?,?)", ('recover123', 'unknown', 'ou_original', 'file1', int(server.time.time())))
+            server.message_db.commit()
+        with patch.object(server, 'upload_and_send_voice_to_feishu', return_value=True) as send:
+            response = await self.client.post('/api/upload_audio', data=b'voice', headers={'X-Recording-ID': 'recover123'})
+            self.assertEqual((await response.json())['status'], 'ok')
+            self.assertEqual(send.call_args.args[1:], ('ou_original', 'recover123', 'file1'))
+
+    async def test_uncertain_old_send_is_not_replayed(self):
+        server.current_open_id = 'ou_test'
+        with server.message_lock:
+            server.message_db.execute("INSERT INTO reply_sends (recording_id,status,recipient,file_key,first_send_at) VALUES (?,?,?,?,?)", ('expired123', 'unknown', 'ou_test', 'file1', int(server.time.time()) - 4000))
+            server.message_db.commit()
+        with patch.object(server, 'upload_and_send_voice_to_feishu') as send:
+            response = await self.client.post('/api/upload_audio', data=b'voice', headers={'X-Recording-ID': 'expired123'})
+            self.assertEqual((await response.json())['status'], 'unknown')
+            send.assert_not_called()
+
+    async def test_feishu_request_uses_stable_uuid_and_records_attempt(self):
+        with server.message_lock:
+            server.message_db.execute("INSERT INTO reply_sends (recording_id,status,recipient,file_key) VALUES (?,?,?,?)", ('stable123', 'sending', 'ou_test', 'file1'))
+            server.message_db.commit()
+        response = SimpleNamespace(json=lambda: {'code': 0})
+        with patch.object(server, 'get_tenant_access_token', return_value='test-token'), patch.object(server.requests, 'post', return_value=response) as post:
+            self.assertTrue(server.send_voice_file_to_feishu('ou_test', 'file1', 'stable123'))
+            self.assertEqual(post.call_args.kwargs['json']['uuid'], 'stable123')
+            first = server.message_db.execute("SELECT first_send_at FROM reply_sends WHERE recording_id='stable123'").fetchone()[0]
+            self.assertIsNotNone(first)
+            self.assertTrue(server.send_voice_file_to_feishu('ou_test', 'file1', 'stable123'))
+            self.assertEqual(first, server.message_db.execute("SELECT first_send_at FROM reply_sends WHERE recording_id='stable123'").fetchone()[0])
+
+    async def test_reply_known_failure_can_be_retried(self):
+        server.current_open_id = 'ou_test'
+        with patch.object(server, 'upload_and_send_voice_to_feishu', side_effect=[False, True]) as send:
+            first = await self.client.post('/api/upload_audio', data=b'voice', headers={'X-Recording-ID': 'retry123'})
+            self.assertEqual((await first.json())['status'], 'failed')
+            second = await self.client.post('/api/upload_audio', data=b'voice', headers={'X-Recording-ID': 'retry123'})
+            self.assertEqual((await second.json())['status'], 'ok')
+            self.assertEqual(send.call_count, 2)
+
+    async def test_failed_first_message_is_retried_before_second(self):
+        calls = []
+        def flaky_tts(text, path):
+            calls.append(text)
+            if text == 'first' and calls.count('first') == 1:
+                raise OSError('temporary')
+            fake_tts(text, path)
+        with patch.object(server, 'sync_generate_tts', side_effect=flaky_tts), patch.object(server.time, 'sleep'):
+            server.on_feishu_message(event('om_fifo1', text='first'))
+            server.on_feishu_message(event('om_fifo2', text='second'))
+            await self.wait_count(2)
+        self.assertEqual(calls, ['first', 'first', 'second'])
+        self.assertEqual(server.queue_snapshot()['head_id'], 'om_fifo1')
+
+    async def test_failed_message_notifies_sender_without_enqueue(self):
+        import threading
+        notified = threading.Event()
+        def notify(sender, text):
+            self.assertEqual(sender, 'ou_test')
+            self.assertIn('重新发送', text)
+            notified.set()
+        with patch.object(server, 'sync_generate_tts', side_effect=OSError('unavailable')), patch.object(server.time, 'sleep'), patch.object(server, 'send_feishu_text', side_effect=notify):
+            server.on_feishu_message(event('om_bad', text='broken'))
+            for _ in range(100):
+                if notified.is_set(): break
+                await asyncio.sleep(.01)
+            self.assertTrue(notified.is_set())
+        self.assertEqual(server.queue_snapshot()['unread_count'], 0)
+        self.assertEqual(server.message_db.execute("SELECT status FROM messages WHERE msg_id='om_bad'").fetchone()[0], 'failed')
+
     async def test_reply_upload_does_not_create_messages(self):
         server.current_open_id = 'ou_test'
         with patch.object(server, 'upload_and_send_voice_to_feishu', return_value=True):
