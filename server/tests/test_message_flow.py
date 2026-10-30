@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -43,6 +44,7 @@ class MessageFlowTest(unittest.IsolatedAsyncioTestCase):
         app = web.Application()
         app.router.add_get('/ws/device', server.ws_handler)
         app.router.add_get('/api/audio/{message_id}.pcm', server.handle_get_pcm)
+        app.router.add_get('/api/audio/{message_id}.mp3', server.handle_get_mp3)
         app.router.add_post('/api/upload_audio', server.handle_upload_audio)
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
@@ -86,6 +88,22 @@ class MessageFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server.queue_snapshot()['unread_count'], 0)
         rows = dict(server.message_db.execute('SELECT msg_id, status FROM messages'))
         self.assertEqual(rows, {'om_one': 'played', 'om_two': 'played'})
+
+    async def test_mp3_stream_metadata_and_fallback(self):
+        server.on_feishu_message(event('om_mp3'))
+        await self.wait_count(1)
+        response = await self.client.get('/api/audio/om_mp3.mp3')
+        self.assertEqual(response.status, 200)
+        data = await response.read()
+        self.assertEqual(data[:4], b'FMP1')
+        self.assertEqual(struct.unpack('<I', data[4:8])[0], 800)
+        self.assertGreater(len(data), 8)
+        self.assertEqual((len(data) - 8) % 144, 0)
+        audio_path = server.unread_messages[0]['audio_path']
+        audio_path.with_suffix('.playback.mp3').unlink()
+        self.assertEqual((await self.client.get('/api/audio/om_mp3.mp3')).status, 404)
+        pcm_response = await self.client.get('/api/audio/om_mp3.pcm')
+        self.assertEqual(await pcm_response.read(), b'\x01\x02' * 800)
 
     async def test_interrupted_processing_is_recovered(self):
         with server.message_lock:

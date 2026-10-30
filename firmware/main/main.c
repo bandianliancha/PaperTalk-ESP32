@@ -25,6 +25,7 @@
 #include "cJSON.h"
 #include "esp_http_server.h"
 #include "prov_screen.h"
+#include "wifi_form.h"
 #include <nvs.h>
 #include "esp_pm.h"
 #include "esp_sleep.h"
@@ -34,7 +35,8 @@ static char g_wifi_pass[64] = "dixchain@pass01!";
 static char g_server_host[64] = "112.126.63.100";
 static int g_server_port = 80;
 static bool g_in_prov_mode = false;
-static int g_wifi_retry_count = 0;
+static httpd_handle_t g_provision_server = NULL;
+static esp_netif_t *g_provision_netif = NULL;
 
 static const char *TAG = "FEISHU_VOICE";
 
@@ -56,7 +58,8 @@ static const char *TAG = "FEISHU_VOICE";
 #define KEY_UP_PIN     GPIO_NUM_39  // 侧上键 (低有效, 音量+)
 #define KEY_DOWN_PIN   GPIO_NUM_18  // 侧下键 (低有效, 音量-)
 
-static int g_current_volume = 10; // 办公室调试初始音量；侧键可调整
+#define MIN_VOLUME_PERCENT 50
+static int g_current_volume = MIN_VOLUME_PERCENT;
 
 // I2C
 #define I2C_SDA_PIN    GPIO_NUM_47
@@ -681,6 +684,72 @@ static void played_ack_retry_task(void *unused) {
     }
 }
 
+extern void *voice_mp3_create(void);
+extern int voice_mp3_frame(void *decoder, const unsigned char *frame, short *samples);
+
+// The server sends 32 kbps fixed-size frames and the original PCM sample count.
+// libmp3lame's 1105-sample encoder delay is removed before publishing playback.
+static bool preload_mp3(const char *id, uint8_t **out, size_t *decoded, int64_t started) {
+    char url[256];
+    snprintf(url, sizeof(url), "http://%s:%d/api/audio/%s.mp3", g_server_host, g_server_port, id);
+    esp_http_client_config_t config = { .url = url, .timeout_ms = 8000 };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    uint8_t *input = malloc(2048 + 144 + 8), *output = NULL;
+    short *pcm = malloc(1152 * sizeof(short));
+    void *decoder = voice_mp3_create();
+    size_t have = 0, wire_read = 0, expected = 0, skip = 1105;
+    bool header = false, ok = false;
+    *out = NULL; *decoded = 0;
+    if (!client || !input || !pcm || !decoder || esp_http_client_open(client, 0) != ESP_OK) goto done;
+    int64_t length = esp_http_client_fetch_headers(client);
+    if (esp_http_client_get_status_code(client) != 200 || length <= 8 || (length - 8) % 144 || length > AUDIO_PRELOAD_MAX_BYTES) goto done;
+    while (wire_read < (size_t)length) {
+        size_t want = (size_t)length - wire_read;
+        if (want > 2048) want = 2048;
+        int n = esp_http_client_read(client, (char *)input + have, want);
+        if (n <= 0) goto done;
+        have += n; wire_read += n;
+        if (!header && have >= 8) {
+            if (memcmp(input, "FMP1", 4)) goto done;
+            uint32_t samples = (uint32_t)input[4] | ((uint32_t)input[5] << 8) | ((uint32_t)input[6] << 16) | ((uint32_t)input[7] << 24);
+            if (!samples || samples > AUDIO_PRELOAD_MAX_BYTES / 2) goto done;
+            expected = (size_t)samples * 2;
+            output = heap_caps_malloc(expected, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!output) goto done;
+            xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+            g_loading_audio_buf = output; g_loading_audio_len = 0;
+            strlcpy(g_loading_message_id, id, sizeof(g_loading_message_id));
+            xSemaphoreGive(g_audio_mutex);
+            memmove(input, input + 8, have - 8); have -= 8; header = true;
+        }
+        size_t pos = 0;
+        while (header && have - pos >= 144) {
+            int count = voice_mp3_frame(decoder, input + pos, pcm);
+            if (count < 0) goto done;
+            pos += 144;
+            size_t first = skip < (size_t)count ? skip : (size_t)count;
+            skip -= first;
+            size_t bytes = ((size_t)count - first) * 2;
+            if (bytes > expected - *decoded) bytes = expected - *decoded;
+            if (bytes) {
+                memcpy(output + *decoded, pcm + first, bytes);
+                *decoded += bytes;
+                xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+                g_loading_audio_len = *decoded;
+                xSemaphoreGive(g_audio_mutex);
+            }
+        }
+        if (pos) { memmove(input, input + pos, have - pos); have -= pos; }
+    }
+    ok = header && have == 0 && !skip && *decoded == expected;
+    if (ok) ESP_LOGI(TAG, "MP3 preload decoded %u bytes from %u in %lld ms", (unsigned)*decoded, (unsigned)wire_read, (esp_timer_get_time() - started) / 1000);
+done:
+    if (client) { esp_http_client_close(client); esp_http_client_cleanup(client); }
+    free(input); free(pcm); free(decoder);
+    *out = output;
+    return ok;
+}
+
 static void preload_audio_task(void *unused) {
     int64_t started = esp_timer_get_time();
     xSemaphoreTake(g_preload_wifi_mutex, portMAX_DELAY);
@@ -705,8 +774,15 @@ static void preload_audio_task(void *unused) {
         esp_http_client_handle_t client = esp_http_client_init(&config);
         uint8_t *buffer = NULL;
         size_t total = 0;
-        bool ok = false;
-        if (client && esp_http_client_open(client, 0) == ESP_OK) {
+        bool ok = preload_mp3(requested_id, &buffer, &total, started);
+        bool partial_mp3 = !ok && total > 0;
+        if (!ok && !partial_mp3) {
+            xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+            g_loading_audio_buf = NULL; g_loading_audio_len = 0; g_loading_message_id[0] = '\0';
+            xSemaphoreGive(g_audio_mutex);
+            free(buffer); buffer = NULL; total = 0;
+        }
+        if (!ok && !partial_mp3 && client && esp_http_client_open(client, 0) == ESP_OK) {
             ESP_LOGI(TAG, "Audio HTTP open after %lld ms", (esp_timer_get_time() - started) / 1000);
             int64_t length = esp_http_client_fetch_headers(client);
             ESP_LOGI(TAG, "Audio HTTP headers after %lld ms, bytes=%lld", (esp_timer_get_time() - started) / 1000, length);
@@ -775,7 +851,7 @@ static void start_preload_latest_audio(void) {
     bool start = g_head_message_id[0] && !g_preload_in_progress;
     if (start) g_preload_in_progress = true;
     portEXIT_CRITICAL(&g_message_lock);
-    if (start && xTaskCreatePinnedToCore(preload_audio_task, "audio_preload", 6144, NULL, 5, NULL, 1) != pdPASS) {
+    if (start && xTaskCreatePinnedToCore(preload_audio_task, "audio_preload", 65536, NULL, 5, NULL, 1) != pdPASS) {
         portENTER_CRITICAL(&g_message_lock);
         g_preload_in_progress = false;
         portEXIT_CRITICAL(&g_message_lock);
@@ -1206,16 +1282,15 @@ static void load_credentials(void) {
     }
 }
 
-static void save_credentials(const char *ssid, const char *pass, const char *srv) {
-    nvs_handle_t my_handle;
-    if (nvs_open("nvs_config", NVS_READWRITE, &my_handle) == ESP_OK) {
-        if (ssid && strlen(ssid) > 0) nvs_set_str(my_handle, "ssid", ssid);
-        if (pass) nvs_set_str(my_handle, "pass", pass);
-        if (srv && strlen(srv) > 0) nvs_set_str(my_handle, "srv", srv);
-        nvs_commit(my_handle);
-        nvs_close(my_handle);
-        ESP_LOGI(TAG, "Credentials committed to NVS!");
-    }
+static esp_err_t save_credentials(const char *ssid, const char *pass) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("nvs_config", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(handle, "ssid", ssid);
+    if (err == ESP_OK) err = nvs_set_str(handle, "pass", pass);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
 }
 
 // ── Web 配网服务 ────────────────────────────────────────────────
@@ -1239,10 +1314,9 @@ static const char *PROV_HTML =
 "<form action='/save' method='POST'>"
 "<label>Wi-Fi 名称 (SSID)</label><input type='text' name='ssid' placeholder='输入 WiFi 名字' required>"
 "<label>Wi-Fi 密码</label><input type='password' name='pass' placeholder='无密码可留空'>"
-"<label>服务器地址</label><input type='text' name='srv' value='192.168.8.13' required>"
 "<button type='submit'>保存并重启连接</button>"
 "</form>"
-"<div class='tip'>点击后设备将自动重启并连上 Wi-Fi<br>屏幕会自动恢复为纯白板</div>"
+"<div class='tip'>请选择 2.4 GHz Wi-Fi。保存后设备将重启并尝试连接。</div>"
 "</div></body></html>";
 
 static esp_err_t prov_root_handler(httpd_req_t *req) {
@@ -1257,121 +1331,105 @@ static void delayed_restart_task(void *pvParameters) {
 }
 
 static esp_err_t prov_save_handler(httpd_req_t *req) {
-    char buf[256] = {0};
-    int ret, remaining = req->content_len;
-    if (remaining >= sizeof(buf)) remaining = sizeof(buf) - 1;
-    ret = httpd_req_recv(req, buf, remaining);
-    if (ret <= 0) {
-        httpd_resp_send_500(req);
+    char buf[512];
+    if (req->content_len <= 0 || req->content_len >= sizeof(buf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid form size");
         return ESP_FAIL;
     }
-    buf[ret] = '\0';
-    ESP_LOGI(TAG, "Received form post: %s", buf);
-
-    // 简单解析 application/x-www-form-urlencoded
-    char ssid[64] = {0}, pass[64] = {0}, srv[64] = {0};
-    char *p = strtok(buf, "&");
-    while (p) {
-        char *eq = strchr(p, '=');
-        if (eq) {
-            *eq = '\0';
-            char *key = p;
-            char *val = eq + 1;
-            if (strcmp(key, "ssid") == 0) strncpy(ssid, val, sizeof(ssid) - 1);
-            else if (strcmp(key, "pass") == 0) strncpy(pass, val, sizeof(pass) - 1);
-            else if (strcmp(key, "srv") == 0) strncpy(srv, val, sizeof(srv) - 1);
-        }
-        p = strtok(NULL, "&");
+    size_t received = 0;
+    while (received < req->content_len) {
+        int n = httpd_req_recv(req, buf + received, req->content_len - received);
+        if (n <= 0) { httpd_resp_send_500(req); return ESP_FAIL; }
+        received += n;
     }
-
-    if (strlen(ssid) > 0) {
-        save_credentials(ssid, pass, srv);
-        const char *resp = "<html><body style='text-align:center;padding:40px;font-family:sans-serif;'><h2>✅ 保存成功！</h2><p>留言机正在重启连接新 Wi-Fi...</p></body></html>";
+    buf[received] = '\0';
+    char ssid[33], pass[64];
+    if (!wifi_form_parse(buf, ssid, pass)) {
+        httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/html; charset=utf-8");
-        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
-
-        xTaskCreate(delayed_restart_task, "restart_task", 2048, NULL, 5, NULL);
-        return ESP_OK;
+        httpd_resp_sendstr(req, "Wi-Fi 名称或密码无效。名称最多 32 字节，密码为空或 8–63 字节。");
+        return ESP_FAIL;
     }
-
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID is required");
-    return ESP_FAIL;
+    esp_err_t err = save_credentials(ssid, pass);
+    memset(pass, 0, sizeof(pass));
+    memset(buf, 0, sizeof(buf));
+    if (err != ESP_OK) { httpd_resp_send_500(req); return ESP_FAIL; }
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_sendstr(req, "<html><meta charset='utf-8'><body><h2>已保存</h2><p>设备将重启并尝试连接。连接失败时可再次连接 PaperTalk-ESP32 修改。</p></body></html>");
+    xTaskCreate(delayed_restart_task, "restart_task", 2048, NULL, 5, NULL);
+    return ESP_OK;
 }
 
 static httpd_handle_t start_webserver(void) {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 8;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t root_uri = {
-            .uri = "/",
-            .method = HTTP_METHOD_GET,
-            .handler = prov_root_handler,
-        };
-        httpd_register_uri_handler(server, &root_uri);
-
-        httpd_uri_t save_uri = {
-            .uri = "/save",
-            .method = HTTP_METHOD_POST,
-            .handler = prov_save_handler,
-        };
-        httpd_register_uri_handler(server, &save_uri);
+    if (httpd_start(&server, &config) != ESP_OK) return NULL;
+    httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = prov_root_handler };
+    httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = prov_save_handler };
+    if (httpd_register_uri_handler(server, &root) != ESP_OK ||
+        httpd_register_uri_handler(server, &save) != ESP_OK) {
+        httpd_stop(server);
+        return NULL;
     }
     return server;
 }
 
-static void start_provisioning_mode(void) {
+// Only the worker changes AP mode; the event loop must never block on setup.
+static bool start_provisioning_mode(void) {
+    ESP_LOGW(TAG, "Starting Wi-Fi setup hotspot");
+    if (!g_provision_netif) g_provision_netif = esp_netif_create_default_wifi_ap();
+    if (!g_provision_netif) return false;
+    wifi_config_t ap_config = { .ap = {
+        .ssid = "PaperTalk-ESP32", .ssid_len = sizeof("PaperTalk-ESP32") - 1, .channel = 1,
+        .max_connection = 4, .authmode = WIFI_AUTH_OPEN,
+    }};
+    if (esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK ||
+        esp_wifi_set_config(WIFI_IF_AP, &ap_config) != ESP_OK) return false;
+    g_provision_server = start_webserver();
+    if (!g_provision_server) { esp_wifi_set_mode(WIFI_MODE_STA); return false; }
     g_in_prov_mode = true;
-    ESP_LOGW(TAG, "Entering Wi-Fi Provisioning (SoftAP) Mode...");
-
-    // Provisioning replaces the current image; invalidate the last-frame cache.
     xSemaphoreTake(g_epd_render_mutex, portMAX_DELAY);
     g_last_epd_valid = false;
     epd_refresh_display(PROV_SCREEN_BITMAP);
     xSemaphoreGive(g_epd_render_mutex);
+    ESP_LOGI(TAG, "Setup hotspot PaperTalk-ESP32 available at 192.168.4.1");
+    return true;
+}
 
-    esp_wifi_stop();
-    esp_netif_create_default_wifi_ap();
+static void stop_provisioning_mode(void) {
+    if (!g_in_prov_mode) return;
+    g_in_prov_mode = false;
+    if (g_provision_server) { httpd_stop(g_provision_server); g_provision_server = NULL; }
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    trigger_screen_refresh();
+    ESP_LOGI(TAG, "Wi-Fi restored; setup hotspot closed");
+}
 
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = "Note4-Voice",
-            .ssid_len = strlen("Note4-Voice"),
-            .channel = 1,
-            .password = "",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN,
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    start_webserver();
-    ESP_LOGI(TAG, "SoftAP 'Note4-Voice' started at 192.168.4.1. Waiting for user setup...");
-
-    // 阻塞保持 SoftAP 运行
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+static void wifi_reconnect_task(void *arg) {
+    int disconnected_seconds = 0;
+    for (;;) {
+        EventBits_t bits = xEventGroupGetBits(wifi_event_group);
+        if (bits & WIFI_CONNECTED_BIT) {
+            disconnected_seconds = 0;
+            stop_provisioning_mode();
+        } else {
+            if (disconnected_seconds >= 30 && !g_in_prov_mode) start_provisioning_mode();
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) ESP_LOGW(TAG, "Wi-Fi reconnect: %s", esp_err_to_name(err));
+            disconnected_seconds += 5;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
-// ── Wi-Fi ──────────────────────────────────────────────────────
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        g_wifi_retry_count++;
-        ESP_LOGW(TAG, "WiFi disconnected (attempt %d/5)...", g_wifi_retry_count);
-        if (g_wifi_retry_count < 5) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            esp_wifi_connect();
-        } else {
-            ESP_LOGE(TAG, "Cannot connect to WiFi! Fallback to SoftAP provisioning...");
-            start_provisioning_mode();
-        }
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGW(TAG, "Wi-Fi disconnected; retrying");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        g_wifi_retry_count = 0;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -1393,7 +1451,7 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
 
     wifi_config_t wifi_config = {0};
-    strncpy((char *)wifi_config.sta.ssid, g_wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
+    memcpy(wifi_config.sta.ssid, g_wifi_ssid, strnlen(g_wifi_ssid, sizeof(wifi_config.sta.ssid)));
     strncpy((char *)wifi_config.sta.password, g_wifi_pass, sizeof(wifi_config.sta.password) - 1);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -1402,6 +1460,7 @@ static void wifi_init_sta(void) {
 
     // 启用 Wi-Fi DTIM Modem-sleep 省电模式 (与 AP 协商 Beacon 唤醒，待机电流立降 70%)
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    xTaskCreate(wifi_reconnect_task, "wifi_reconnect", 8192, NULL, 3, NULL);
 }
 
 // 播放一段温和的提示音 (简单正弦波 PCM)
@@ -1505,9 +1564,9 @@ static void button_task(void *pvParameters) {
         if (gpio_get_level(KEY_DOWN_PIN) == 0) {
             vTaskDelay(pdMS_TO_TICKS(50));
             if (gpio_get_level(KEY_DOWN_PIN) == 0) {
-                if (g_current_volume > 10) {
+                if (g_current_volume > MIN_VOLUME_PERCENT) {
                     g_current_volume -= 20;
-                    if (g_current_volume < 10) g_current_volume = 10;
+                    if (g_current_volume < MIN_VOLUME_PERCENT) g_current_volume = MIN_VOLUME_PERCENT;
                     esp_codec_dev_set_out_vol(play_dev, g_current_volume);
                     ESP_LOGI(TAG, "Volume DOWN -> %d%%", g_current_volume);
                     if (audio_session_begin()) {

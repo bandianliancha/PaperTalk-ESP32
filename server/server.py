@@ -11,6 +11,7 @@ import threading
 import wave
 import array
 import tempfile
+import struct
 from types import SimpleNamespace
 from pathlib import Path
 from datetime import datetime
@@ -677,6 +678,27 @@ def process_feishu_message(msg, sender_id):
     logger.error("Message %s failed after 3 attempts; retaining it for diagnosis", msg.message_id)
     reaction_executor.submit(send_feishu_text, sender_id, "这条消息处理失败，设备未收到，请重新发送文字或语音。")
 
+def prepare_playback_mp3(wav_path: Path):
+    """Prepare 16 kHz, mono CBR frames; PCM remains the reliable fallback."""
+    mp3_path = wav_path.with_suffix(".playback.mp3")
+    temp_path = mp3_path.with_suffix(".tmp.mp3")
+    try:
+        mp3_path.unlink(missing_ok=True)
+        with wave.open(str(wav_path), "rb") as wav:
+            if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 16000):
+                raise ValueError("Unexpected audio format")
+        subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(wav_path),
+                        "-map_metadata", "-1", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame",
+                        "-b:a", "32k", "-write_xing", "0", "-id3v2_version", "0", str(temp_path)],
+                       check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if not temp_path.stat().st_size or temp_path.stat().st_size % 144:
+            raise ValueError("Unexpected MP3 frame length")
+        temp_path.replace(mp3_path)
+    except (OSError, subprocess.SubprocessError, wave.Error, ValueError):
+        logger.exception("MP3 preparation failed; PCM remains available for %s", wav_path.name)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
 def process_feishu_message_once(msg, sender_id):
     global current_open_id
     msg_id = msg.message_id
@@ -698,6 +720,7 @@ def process_feishu_message_once(msg, sender_id):
             if not text:
                 raise ValueError("Empty text message")
             sync_generate_tts(text, msg_wav_path)
+        prepare_playback_mp3(msg_wav_path)
         item = {"msg_id": msg_id, "audio_path": msg_wav_path, "text": text, "timestamp": int(time.time())}
         with message_lock:
             message_db.execute("UPDATE messages SET audio_path=?, text=?, timestamp=?, status='ready' WHERE msg_id=?",
@@ -814,6 +837,26 @@ async def handle_get_pcm(request):
         logger.exception("Cannot read audio for %s", msg_id)
         return web.Response(status=500, text="Invalid audio")
 
+async def handle_get_mp3(request):
+    msg_id = request.match_info["message_id"]
+    with message_lock:
+        item = next((item for item in unread_messages if item["msg_id"] == msg_id), None)
+        path = item["audio_path"] if item else None
+    if path is None:
+        return web.Response(status=404, text="Message not unread")
+    try:
+        with wave.open(str(path), "rb") as wav:
+            if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 16000):
+                raise ValueError("Unexpected audio format")
+            samples = wav.getnframes()
+        encoded = path.with_suffix(".playback.mp3").read_bytes()
+        if not encoded or len(encoded) % 144:
+            raise ValueError("Invalid MP3 frames")
+        return web.Response(body=b"FMP1" + struct.pack("<I", samples) + encoded,
+                            content_type="application/octet-stream")
+    except (OSError, wave.Error, ValueError):
+        return web.Response(status=404, text="MP3 unavailable")
+
 async def handle_get_screen(request):
     if not latest_epd_img_path.exists():
         return web.Response(status=404, text="No screen bitmap available")
@@ -877,6 +920,7 @@ async def start_http_app():
     app.router.add_get("/ws/device", ws_handler)
     app.router.add_get("/api/audio/latest.wav", handle_get_audio)
     app.router.add_get("/api/audio/{message_id}.pcm", handle_get_pcm)
+    app.router.add_get("/api/audio/{message_id}.mp3", handle_get_mp3)
     app.router.add_get("/api/screen/latest.bin", handle_get_screen)
     app.router.add_post("/api/upload_audio", handle_upload_audio)
     runner = web.AppRunner(app)
