@@ -3,4 +3,4 @@
 #include <stddef.h>
 
 // Parse an application/x-www-form-urlencoded body without truncation.
-bool wifi_form_parse(char *body, char ssid[33], char password[64]);
+bool wifi_form_parse(char *body, char ssid[33], char password[64], char server[64], unsigned *port);

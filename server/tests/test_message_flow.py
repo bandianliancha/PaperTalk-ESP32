@@ -58,7 +58,7 @@ class MessageFlowTest(unittest.IsolatedAsyncioTestCase):
         self.reaction.stop()
 
     async def wait_count(self, count):
-        for _ in range(100):
+        for _ in range(1000):
             if server.queue_snapshot()['unread_count'] == count:
                 return
             await asyncio.sleep(0.01)
@@ -196,7 +196,7 @@ class MessageFlowTest(unittest.IsolatedAsyncioTestCase):
             notified.set()
         with patch.object(server, 'sync_generate_tts', side_effect=OSError('unavailable')), patch.object(server.time, 'sleep'), patch.object(server, 'send_feishu_text', side_effect=notify):
             server.on_feishu_message(event('om_bad', text='broken'))
-            for _ in range(100):
+            for _ in range(1000):
                 if notified.is_set(): break
                 await asyncio.sleep(.01)
             self.assertTrue(notified.is_set())

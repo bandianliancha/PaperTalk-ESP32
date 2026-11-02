@@ -1,5 +1,6 @@
 #include "wifi_form.h"
 #include <string.h>
+#include <ctype.h>
 
 static int hex_value(unsigned char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -28,9 +29,10 @@ static bool decode_value(const char *source, char *dest, size_t capacity) {
     return true;
 }
 
-bool wifi_form_parse(char *body, char ssid[33], char password[64]) {
-    bool have_ssid = false, have_password = false;
-    ssid[0] = password[0] = '\0';
+bool wifi_form_parse(char *body, char ssid[33], char password[64], char server[64], unsigned *port) {
+    bool have_ssid = false, have_password = false, have_server = false, have_port = false;
+    ssid[0] = password[0] = server[0] = '\0';
+    *port = 0;
     char *save = NULL;
     for (char *part = strtok_r(body, "&", &save); part; part = strtok_r(NULL, "&", &save)) {
         char *equal = strchr(part, '=');
@@ -42,7 +44,22 @@ bool wifi_form_parse(char *body, char ssid[33], char password[64]) {
         } else if (strcmp(part, "pass") == 0) {
             if (have_password || !decode_value(equal, password, 64)) return false;
             have_password = true;
+        } else if (strcmp(part, "server") == 0) {
+            if (have_server || !decode_value(equal, server, 64)) return false;
+            have_server = true;
+        } else if (strcmp(part, "port") == 0) {
+            if (have_port) return false;
+            have_port = true;
+            for (const unsigned char *c = (const unsigned char *)equal; *c; c++) {
+                if (*c < '0' || *c > '9' || *port > 6553) return false;
+                *port = *port * 10 + (*c - '0');
+            }
+            if (*equal && (!*port || *port > 65535)) return false;
         }
+    }
+    for (const unsigned char *c = (const unsigned char *)server; *c; c++) {
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+              (*c >= '0' && *c <= '9') || *c == '.' || *c == '-')) return false;
     }
     size_t pass_len = strlen(password);
     return have_ssid && have_password && ssid[0] && (!pass_len || pass_len >= 8);

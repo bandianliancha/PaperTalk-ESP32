@@ -26,27 +26,21 @@
 #include "esp_http_server.h"
 #include "prov_screen.h"
 #include "wifi_form.h"
+#include "button_policy.h"
+#include "sound_activity.h"
 #include <nvs.h>
 #include "esp_pm.h"
 #include "esp_sleep.h"
 
-static char g_wifi_ssid[64] = "DIXAI";
-static char g_wifi_pass[64] = "dixchain@pass01!";
-static char g_server_host[64] = "112.126.63.100";
+static char g_wifi_ssid[64] = "";
+static char g_wifi_pass[64] = "";
+static char g_server_host[64] = "";
 static int g_server_port = 80;
 static bool g_in_prov_mode = false;
 static httpd_handle_t g_provision_server = NULL;
 static esp_netif_t *g_provision_netif = NULL;
 
 static const char *TAG = "FEISHU_VOICE";
-
-// ── WiFi 配置 ──────────────────────────────────────────────────
-#define WIFI_SSID      "DIXAI"
-#define WIFI_PASS      "dixchain@pass01!"
-
-// ── 服务器配置 ────────────────────────────────────────────────
-#define DEFAULT_SERVER_HOST    "112.126.63.100"
-#define DEFAULT_SERVER_PORT    80
 
 // ── Note4 板级 GPIO ──────────────────────────────────────────
 #define VBAT_PWR_PIN   GPIO_NUM_17  // 必须拉高自锁供电
@@ -148,6 +142,7 @@ static int read_battery_percent(bool *charging) {
 
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
+#define SERVER_CONFIGURED_BIT BIT1
 
 static esp_websocket_client_handle_t ws_client = NULL;
 static i2s_chan_handle_t tx_handle = NULL;
@@ -859,38 +854,56 @@ static void start_preload_latest_audio(void) {
     }
 }
 
-// During playback, short press toggles pause; long press interrupts for recording.
-static bool playback_control(bool *paused) {
-    do {
-        if (gpio_get_level(KEY_ENTER_PIN) == 0) {
-            int held = 0;
-            while (gpio_get_level(KEY_ENTER_PIN) == 0) {
-                vTaskDelay(pdMS_TO_TICKS(20));
-                held += 20;
-                if (held >= 300) return true;
-            }
-            if (held >= 20) {
-                *paused = !*paused;
-                ESP_LOGI(TAG, "Playback %s", *paused ? "paused" : "resumed");
-            }
+// A separate watcher samples the button even while the I2S write blocks.
+// Releasing the original press permanently cancels the post-playback reply;
+// subsequent taps cannot pause the message or arm a reply.
+static TaskHandle_t g_hold_watch_task = NULL;
+static portMUX_TYPE g_hold_watch_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool g_hold_watch_active = false;
+static playback_hold_t g_playback_hold;
+
+static void playback_hold_watch_task(void *arg) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        for (;;) {
+            bool pressed = gpio_get_level(KEY_ENTER_PIN) == 0;
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            portENTER_CRITICAL(&g_hold_watch_lock);
+            bool active = g_hold_watch_active;
+            if (active) playback_hold_update(&g_playback_hold, pressed, now_ms);
+            portEXIT_CRITICAL(&g_hold_watch_lock);
+            if (!active) break;
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
-        if (*paused) vTaskDelay(pdMS_TO_TICKS(20));
-    } while (*paused);
-    return false;
+    }
+}
+
+static void start_playback_hold_watch(void) {
+    portENTER_CRITICAL(&g_hold_watch_lock);
+    g_playback_hold = (playback_hold_t){ .continuous = true, .released_at_ms = -1 };
+    g_hold_watch_active = g_hold_watch_task != NULL;
+    portEXIT_CRITICAL(&g_hold_watch_lock);
+    if (g_hold_watch_task) xTaskNotifyGive(g_hold_watch_task);
+}
+
+static bool finish_playback_hold_watch(void) {
+    bool pressed = gpio_get_level(KEY_ENTER_PIN) == 0;
+    portENTER_CRITICAL(&g_hold_watch_lock);
+    bool held = g_hold_watch_active && g_playback_hold.continuous && pressed;
+    g_hold_watch_active = false;
+    portEXIT_CRITICAL(&g_hold_watch_lock);
+    return held;
 }
 
 // Read a growing cache without holding the mutex during I2S writes. A failed
 // partial playback is never acknowledged as read or restarted from byte zero.
-static bool play_progressive_audio(const char *target_id, bool *wrote_any, bool *interrupted, bool *paused, int64_t started) {
+static bool play_progressive_audio(const char *target_id, bool *wrote_any, int64_t started) {
     uint8_t chunk[2048];
     size_t offset = 0;
     int64_t last_progress = esp_timer_get_time();
     bool amplifier_on = false;
     *wrote_any = false;
     while (true) {
-        int64_t control_started = esp_timer_get_time();
-        if (playback_control(paused)) { *interrupted = true; return false; }
-        last_progress += esp_timer_get_time() - control_started;
         size_t amount = 0;
         bool complete = false;
         size_t buffered = 0;
@@ -954,10 +967,10 @@ static bool play_latest_audio(void) {
         strlcpy(target_id, g_cached_message_id, sizeof(target_id));
         xSemaphoreGive(g_audio_mutex);
     }
-    bool wrote_any = false, interrupted = false, paused = false;
-    bool played = target_id[0] && play_progressive_audio(target_id, &wrote_any, &interrupted, &paused, started);
+    bool wrote_any = false;
+    bool played = target_id[0] && play_progressive_audio(target_id, &wrote_any, started);
     bool cached = played || wrote_any;
-    if (!cached && unread && !interrupted) {
+    if (!cached && unread) {
         char url[256];
         snprintf(url, sizeof(url), "http://%s:%d/api/audio/%s.pcm", g_server_host, g_server_port, message_id);
         esp_http_client_config_t config = { .url = url, .timeout_ms = 5000 };
@@ -975,7 +988,6 @@ static bool play_latest_audio(void) {
                 gpio_hold_en(PA_CTRL_PIN);
                 played = true;
                 while (total < length && (r = esp_http_client_read(client, buffer, sizeof(buffer))) > 0) {
-                    if (playback_control(&paused)) { interrupted = true; played = false; break; }
                     if (total == 0) ESP_LOGI(TAG, "First streamed audio received after %lld ms", (esp_timer_get_time() - started) / 1000);
                     if (esp_codec_dev_write(play_dev, buffer, r) != ESP_CODEC_DEV_OK) { played = false; break; }
                     if (replay) memcpy(replay + total, buffer, r);
@@ -1002,16 +1014,19 @@ static bool play_latest_audio(void) {
     gpio_hold_dis(PA_CTRL_PIN);
     gpio_set_level(PA_CTRL_PIN, 0);
     gpio_hold_en(PA_CTRL_PIN);
+    bool reply_requested = finish_playback_hold_watch() && played;
     if (played && unread) {
         portENTER_CRITICAL(&g_message_lock);
         strlcpy(g_pending_played_id, message_id, sizeof(g_pending_played_id));
         portEXIT_CRITICAL(&g_message_lock);
-        send_played_ack(message_id);
-    } else if (!played && !interrupted) {
+        // Do not delay the start of recording on a WebSocket write.
+        // The existing retry task sends the acknowledgement in the background.
+        if (!reply_requested) send_played_ack(message_id);
+    } else if (!played) {
         ESP_LOGW(TAG, "Playback failed; message remains unread");
         play_beep_tone(400, 120);
     }
-    return interrupted;
+    return reply_requested;
 }
 
 static void play_beep_tone(int freq_hz, int duration_ms);
@@ -1109,24 +1124,23 @@ static void record_and_upload(void) {
     }
 
     size_t recorded_pcm = 0;
+    unsigned active_blocks = 0;
     while (gpio_get_level(KEY_ENTER_PIN) == 0 && recorded_pcm < max_bytes) {
         size_t chunk = 1024;
-        esp_codec_dev_read(record_dev, rec_buf + 44 + recorded_pcm, chunk);
+        if (esp_codec_dev_read(record_dev, rec_buf + 44 + recorded_pcm, chunk) != ESP_CODEC_DEV_OK) break;
+        if (audio_block_has_sound((const int16_t *)(rec_buf + 44 + recorded_pcm), chunk / 2)) active_blocks++;
         recorded_pcm += chunk;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     gpio_set_level(LED_PIN, 1); // 立即熄灭录音灯，体感无任何拖泥带水
 
-    // 录音有效性防御：若录音小于 0.3 秒（纯误触），则静默放弃上传并短哔提示
-    if (recorded_pcm < 16000 * 2 * 0.3) {
-        ESP_LOGW(TAG, "Recording too short (<0.3s), discarded as accidental press.");
-        play_beep_tone(400, 50); // 低音提示无效
+    // A short but audible reply should be sent; discard only near-silence.
+    if (!recorded_pcm || !active_blocks) {
+        ESP_LOGI(TAG, "Recording is near-silent; discarded");
         free(rec_buf);
         return;
     }
-
-
     ESP_LOGI(TAG, "Recording stopped. Uploading %d bytes...", recorded_pcm);
 
     // 填充 44 字节 WAV 头
@@ -1278,16 +1292,20 @@ static void load_credentials(void) {
         if (nvs_get_str(my_handle, "srv", g_server_host, &required_size) == ESP_OK) {
             ESP_LOGI(TAG, "Loaded Server host from NVS: %s", g_server_host);
         }
+        uint16_t port = 0;
+        if (nvs_get_u16(my_handle, "srv_port", &port) == ESP_OK && port) g_server_port = port;
         nvs_close(my_handle);
     }
 }
 
-static esp_err_t save_credentials(const char *ssid, const char *pass) {
+static esp_err_t save_credentials(const char *ssid, const char *pass, const char *server, uint16_t port) {
     nvs_handle_t handle;
     esp_err_t err = nvs_open("nvs_config", NVS_READWRITE, &handle);
     if (err != ESP_OK) return err;
     err = nvs_set_str(handle, "ssid", ssid);
     if (err == ESP_OK) err = nvs_set_str(handle, "pass", pass);
+    if (err == ESP_OK) err = nvs_set_str(handle, "srv", server);
+    if (err == ESP_OK) err = nvs_set_u16(handle, "srv_port", port);
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
     return err;
@@ -1314,6 +1332,8 @@ static const char *PROV_HTML =
 "<form action='/save' method='POST'>"
 "<label>Wi-Fi 名称 (SSID)</label><input type='text' name='ssid' placeholder='输入 WiFi 名字' required>"
 "<label>Wi-Fi 密码</label><input type='password' name='pass' placeholder='无密码可留空'>"
+"<label>自己的服务器 IP 或域名</label><input type='text' name='server' placeholder='留空则保留已保存地址'>"
+"<label>服务器端口</label><input type='number' name='port' min='1' max='65535' placeholder='留空则保留已保存端口，默认 80'>"
 "<button type='submit'>保存并重启连接</button>"
 "</form>"
 "<div class='tip'>请选择 2.4 GHz Wi-Fi。保存后设备将重启并尝试连接。</div>"
@@ -1343,14 +1363,17 @@ static esp_err_t prov_save_handler(httpd_req_t *req) {
         received += n;
     }
     buf[received] = '\0';
-    char ssid[33], pass[64];
-    if (!wifi_form_parse(buf, ssid, pass)) {
+    char ssid[33], pass[64], server[64];
+    unsigned port = 0;
+    if (!wifi_form_parse(buf, ssid, pass, server, &port) || (!server[0] && !g_server_host[0])) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "text/html; charset=utf-8");
-        httpd_resp_sendstr(req, "Wi-Fi 名称或密码无效。名称最多 32 字节，密码为空或 8–63 字节。");
+        httpd_resp_sendstr(req, "配置无效。请填写 Wi-Fi、有效的服务器 IP 或域名及端口（1–65535）。");
         return ESP_FAIL;
     }
-    esp_err_t err = save_credentials(ssid, pass);
+    const char *selected_server = server[0] ? server : g_server_host;
+    uint16_t selected_port = (uint16_t)(port ? port : g_server_port);
+    esp_err_t err = save_credentials(ssid, pass, selected_server, selected_port);
     memset(pass, 0, sizeof(pass));
     memset(buf, 0, sizeof(buf));
     if (err != ESP_OK) { httpd_resp_send_500(req); return ESP_FAIL; }
@@ -1410,13 +1433,16 @@ static void wifi_reconnect_task(void *arg) {
     int disconnected_seconds = 0;
     for (;;) {
         EventBits_t bits = xEventGroupGetBits(wifi_event_group);
-        if (bits & WIFI_CONNECTED_BIT) {
+        if ((bits & WIFI_CONNECTED_BIT) && (bits & SERVER_CONFIGURED_BIT)) {
             disconnected_seconds = 0;
             stop_provisioning_mode();
         } else {
-            if (disconnected_seconds >= 30 && !g_in_prov_mode) start_provisioning_mode();
-            esp_err_t err = esp_wifi_connect();
-            if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) ESP_LOGW(TAG, "Wi-Fi reconnect: %s", esp_err_to_name(err));
+            bool needs_setup = !g_wifi_ssid[0] || !(bits & SERVER_CONFIGURED_BIT);
+            if ((needs_setup || disconnected_seconds >= 30) && !g_in_prov_mode) start_provisioning_mode();
+            if (!(bits & WIFI_CONNECTED_BIT) && g_wifi_ssid[0]) {
+                esp_err_t err = esp_wifi_connect();
+                if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) ESP_LOGW(TAG, "Wi-Fi reconnect: %s", esp_err_to_name(err));
+            }
             disconnected_seconds += 5;
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -1425,7 +1451,7 @@ static void wifi_reconnect_task(void *arg) {
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        if (g_wifi_ssid[0]) esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
         ESP_LOGW(TAG, "Wi-Fi disconnected; retrying");
@@ -1438,6 +1464,7 @@ static void wifi_init_sta(void) {
     load_credentials();
 
     wifi_event_group = xEventGroupCreate();
+    if (g_server_host[0]) xEventGroupSetBits(wifi_event_group, SERVER_CONFIGURED_BIT);
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -1455,7 +1482,7 @@ static void wifi_init_sta(void) {
     strncpy((char *)wifi_config.sta.password, g_wifi_pass, sizeof(wifi_config.sta.password) - 1);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    if (g_wifi_ssid[0]) ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     // 启用 Wi-Fi DTIM Modem-sleep 省电模式 (与 AP 协商 Beacon 唤醒，待机电流立降 70%)
@@ -1489,53 +1516,39 @@ static void play_beep_tone(int freq_hz, int duration_ms) {
 // ── 按键任务 ───────────────────────────────────────────────────
 static void button_task(void *pvParameters) {
     while (1) {
-        // 1. 中间大主键：短按听留言，长按录音 (极速响应：20ms消抖 + 280ms长按判定 = 300ms)
+        // Press starts playback immediately; hold through the entire message
+        // to record a reply. Pending replies retain their retry/discard controls.
         if (gpio_get_level(KEY_ENTER_PIN) == 0) {
             vTaskDelay(pdMS_TO_TICKS(20));
             if (gpio_get_level(KEY_ENTER_PIN) == 0) {
-                int hold_time = 20;
-                while (gpio_get_level(KEY_ENTER_PIN) == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(20));
-                    hold_time += 20;
-                    if (hold_time >= 300) {
-                        break;
-                    }
-                }
-
-                if (g_reply_buf) {
-                    if (hold_time >= 300) {
-                        if (remove_saved_reply()) {
-                            free(g_reply_buf);
-                            g_reply_buf = NULL;
-                            g_reply_size = 0;
-                            update_reply_status(REPLY_IDLE);
-                        }
-                    } else if (audio_session_begin()) {
-                        send_retained_reply();
-                        audio_session_end();
-                    }
-                    while (gpio_get_level(KEY_ENTER_PIN) == 0) vTaskDelay(pdMS_TO_TICKS(20));
-                } else if (hold_time >= 300) {
-                    if (audio_session_begin()) {
-                        record_and_upload();
-                        audio_session_end();
-                    }
-                } else {
-                    while (gpio_get_level(KEY_ENTER_PIN) == 0) {
+                if (g_reply_buf || !(g_unread_count > 0 || g_preload_audio_len > 0)) {
+                    int hold_time = 20;
+                    while (gpio_get_level(KEY_ENTER_PIN) == 0 && hold_time < BUTTON_RECORD_HOLD_MS) {
                         vTaskDelay(pdMS_TO_TICKS(20));
+                        hold_time += 20;
                     }
-                    // 智能播放与反复聆听支持：
-                    // 只要当前有未读信封，或者本地依然保留着上一条语音的缓存，孩子短按都能反复重听！
-                    ESP_LOGI(TAG, "Short press recognized (%d ms), unread=%d", hold_time, g_unread_count);
-                    if (audio_session_begin()) {
-                        if (g_unread_count > 0 || g_preload_audio_len > 0) {
-                            if (play_latest_audio()) record_and_upload();
-                        } else {
-                            play_beep_tone(600, 40);
+                    if (g_reply_buf) {
+                        if (hold_time >= BUTTON_RECORD_HOLD_MS) {
+                            if (remove_saved_reply()) {
+                                free(g_reply_buf); g_reply_buf = NULL; g_reply_size = 0;
+                                update_reply_status(REPLY_IDLE);
+                            }
+                        } else if (audio_session_begin()) {
+                            send_retained_reply(); audio_session_end();
                         }
-                        audio_session_end();
+                    } else if (hold_time >= BUTTON_RECORD_HOLD_MS) {
+                        if (audio_session_begin()) { record_and_upload(); audio_session_end(); }
+                    } else if (audio_session_begin()) {
+                        play_beep_tone(600, 40); audio_session_end();
                     }
+                } else if (audio_session_begin()) {
+                    start_playback_hold_watch();
+                    bool reply_requested = play_latest_audio();
+                    if (reply_requested && gpio_get_level(KEY_ENTER_PIN) == 0) record_and_upload();
+                    audio_session_end();
                 }
+                // Swallow a press that overlaps the end or a failed playback.
+                while (gpio_get_level(KEY_ENTER_PIN) == 0) vTaskDelay(pdMS_TO_TICKS(20));
             }
         }
 
@@ -1560,7 +1573,7 @@ static void button_task(void *pvParameters) {
             }
         }
 
-        // 3. 侧下键 (KEY_DOWN_PIN, GPIO 18): 音量减至 10%，屏蔽长按关机
+        // 3. 侧下键 (KEY_DOWN_PIN, GPIO 18): 音量减至设定下限，屏蔽长按关机
         if (gpio_get_level(KEY_DOWN_PIN) == 0) {
             vTaskDelay(pdMS_TO_TICKS(50));
             if (gpio_get_level(KEY_DOWN_PIN) == 0) {
@@ -1624,7 +1637,7 @@ void app_main(void) {
 
     // 连接 Wi-Fi
     wifi_init_sta();
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
+    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT | SERVER_CONFIGURED_BIT, false, true, portMAX_DELAY);
     ESP_LOGI(TAG, "WiFi connected!");
 
     // 创建墨水屏刷新独立任务
@@ -1643,6 +1656,8 @@ void app_main(void) {
     esp_websocket_client_start(ws_client);
 
     xTaskCreate(played_ack_retry_task, "played_ack", 4096, NULL, 3, NULL);
+    if (xTaskCreate(playback_hold_watch_task, "hold_watch", 2048, NULL, 6, &g_hold_watch_task) != pdPASS)
+        ESP_LOGE(TAG, "Could not start playback hold watcher; playback remains available");
     xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);
     xTaskCreate(battery_monitor_task, "battery_monitor_task", 4096, NULL, 2, NULL);
 }
